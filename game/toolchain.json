@@ -1,0 +1,65 @@
+{
+  "toolchain_version": 1,
+  "runner_image": "ubuntu-24.04",
+  "engine": {
+    "repo": "https://github.com/nikitastetskiy/doomreplay",
+    "upstream": "https://github.com/ggerganov/doomreplay",
+    "commit_sha": "f37f5bf81daaa2fc9e39b53d6a52eeff80eb299a",
+    "build_dir": "doomgeneric",
+    "build_cmd": "make -f Makefile.dr",
+    "binary": "doomgeneric",
+    "resolution": "640x400",
+    "pixel_format": "bgra_alpha_zero",
+    "build_sha256": {
+      "value": "40588a1662efc8e1634d067835d9cadd2de12fa5cb3e3d7e3238ada4a6d02eff",
+      "status": "provisional_local",
+      "platform": "macos-arm64 (apple clang)",
+      "note": "canonical ubuntu-24.04 build SHA-256 is captured in E7 task 1 (plan D9) in one authorized update"
+    }
+  },
+  "wad": {
+    "file": "game/assets/freedoom1.wad",
+    "sha256": "7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d",
+    "release": "Freedoom 0.13.0",
+    "source_url": "https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip",
+    "archive_sha256": "3f9b264f3e3ce503b4fb7f6bdcb1f419d93c7b546f4df3e874dd878db9688f59",
+    "provenance": "freedoom-0.13.0.zip SHA-256 verified against the PGP-signed freedoom-0.13.0-CHECKSUM asset published on the official v0.13.0 GitHub release (2026-07-30); freedoom1.wad extracted from the verified archive"
+  },
+  "ffmpeg": {
+    "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-29-13-36/ffmpeg-n8.1.2-31-g8c9502e9b0-linux64-gpl-8.1.tar.xz",
+    "release_tag": "autobuild-2026-07-29-13-36",
+    "tarball_sha256": "9fb60ff01e6574258dc76efdf94f901a651582da67b8edcfd10e8860233b7ef4",
+    "binary_path_in_tarball": "ffmpeg-n8.1.2-31-g8c9502e9b0-linux64-gpl-8.1/bin/ffmpeg",
+    "binary_sha256": "6cc3708dab4dec37151e2312327bb19bfea7b1ac59fefe94756609b98139fce4",
+    "version_line": "ffmpeg version n8.1.2-31-g8c9502e9b0-20260729 Copyright (c) 2000-2026 the FFmpeg developers",
+    "checksum_provenance": "tarball SHA-256 verified against the checksums.sha256 asset published on the immutable autobuild-2026-07-29-13-36 release; version line captured by executing the binary on ubuntu:24.04 (docker linux/amd64, 2026-07-30)",
+    "delivery": "cache or release asset on nikitastetskiy/doomreplay; binary SHA-256 verified before execution (RFC executable-integrity rule); never apt-get"
+  },
+  "encode": {
+    "input_declaration": "-f rawvideo -framerate 35 -s 640x400 -pix_fmt bgr0",
+    "pix_fmt_warning": "engine emits BGRA with alpha byte 0x00; the rawvideo input MUST be declared bgr0 (alpha ignored). Declaring bgra makes every pixel fully transparent in GIF output (GIF supports transparency) and silently produces a blank few-KB file. h264/yuv420p paths never exposed this upstream.",
+    "filtergraph_l0": "fps=12,scale=320:-1,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle",
+    "filtergraph_l1": "fps=12,scale=320:-1,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle",
+    "filtergraph_l2": "fps=10,scale=256:-1,split[a][b];[a]palettegen=max_colors=64[p];[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle",
+    "ladder": {
+      "ceiling_bytes": 4000000,
+      "l0_tail_seconds": 15,
+      "l1_tail_seconds": 12,
+      "l2_tail_seconds": 12
+    },
+    "measured_encode_rate_local": {
+      "measured_date": "2026-07-30",
+      "encoder": "pinned ffmpeg n8.1.2-31-g8c9502e9b0 executed on ubuntu:24.04 (docker linux/amd64)",
+      "content": "worst-case active-play tail of game/tests/fixtures/golden.stream (continuous run/turn/strafe/fire)",
+      "l0_params_rate_kb_per_s": 247.5,
+      "table": [
+        {"clip_s": 20, "params": "320px/12fps/128c", "bytes": 5329379, "note": "rejected L0 - exceeds 4.0 MB ceiling"},
+        {"clip_s": 15, "params": "320px/12fps/128c", "bytes": 3712172, "note": "adopted L0"},
+        {"clip_s": 12, "params": "320px/12fps/128c", "bytes": 2640433, "note": "adopted L1"},
+        {"clip_s": 15, "params": "256px/10fps/64c", "bytes": 1929406, "note": "reference"},
+        {"clip_s": 12, "params": "256px/10fps/64c", "bytes": 1373892, "note": "adopted L2"}
+      ],
+      "conclusion": "worst-case rate ~248-267 KB/s at 320px/12fps/128c invalidates the provisional ~150 KB/s figure and the 20 s L0; ladder constants adjusted in game/SPEC.md section 12 (shape and ceiling unchanged)"
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "fixture": "game/tests/fixtures/golden.stream",
+  "fixture_sha256": "8c6b095e33f054b813f3f7d7519a8ecac0f2f7964ced2c9eb53be7f43c70548e",
+  "status": "provisional_local",
+  "status_note": "values measured on the macos-arm64 local engine build; the canonical ubuntu-24.04 values are captured in E7 task 1 (plan D9) in one authorized, documented update, then this file re-verifies green",
+  "engine_commit_sha": "f37f5bf81daaa2fc9e39b53d6a52eeff80eb299a",
+  "wad_sha256": "7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d",
+  "invocation": {
+    "argv": ["doomgeneric", "-iwad", "game/assets/freedoom1.wad", "-input", "game/tests/fixtures/golden.stream", "-nrecord", "700", "-output", "<raw-capture-path>"],
+    "note": "raw BGRA framebuffer captured via an ffmpeg-named shim that writes stdin to the output path; no -render_frame/-render_input/-render_username overlays; stdin </dev/null; exit code 0"
+  },
+  "n_frames": 966,
+  "recorded_frames": 700,
+  "frame_bytes": 1024000,
+  "recorded_stream_bytes": 716800000,
+  "recorded_stream_sha256": "7cc38611ed92453ab3015dfa2e4a97f43a393010f9eb12f027624234cf014d98",
+  "final_frame_sha256": "61c6826d70a9ce3d3da05bca0c8acb1baaa78f5a1fb5def25214d65272e4fadd",
+  "replay_agreement": {
+    "run1_recorded_stream_sha256": "7cc38611ed92453ab3015dfa2e4a97f43a393010f9eb12f027624234cf014d98",
+    "run2_recorded_stream_sha256": "7cc38611ed92453ab3015dfa2e4a97f43a393010f9eb12f027624234cf014d98",
+    "verified": "2026-07-30 - two independent full replays on the local build produced byte-identical 716,800,000-byte recorded streams"
+  },
+  "final_frame_visual": "in-level first-person view with full HUD (ammo 44, health 72%, armor 0%) - verified by frame grab 2026-07-30"
+}

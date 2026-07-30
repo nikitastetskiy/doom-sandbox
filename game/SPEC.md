@@ -147,9 +147,15 @@ Copied from RFC 001 ("Failure-path write contract", normative there), with the g
 
 - **Hard byte ceiling: 4.0 MB = 4,000,000 bytes** (single exact constant; under the 5 MB Camo reference cap with headroom).
 - Re-encode ladder (checked-in budget script; hard-fail, no publish, if L2 still exceeds the ceiling):
-  - **L0**: 20 s tail @ 320 px wide / 12 fps / 128 colors (bayer dithered)
-  - **L1**: 15 s tail @ 320 px / 12 fps / 128 colors
-  - **L2**: 15 s tail @ 256 px / 10 fps / 64 colors
+  - **L0**: 15 s tail @ 320 px wide / 12 fps / 128 colors (bayer dithered)
+  - **L1**: 12 s tail @ 320 px / 12 fps / 128 colors
+  - **L2**: 12 s tail @ 256 px / 10 fps / 64 colors
+- Ladder constants adjusted in E2 (2026-07-30) per the RFC's plan-time re-verify (Sho S2): worst-case
+  active-play encode rate measured at ~248–267 KB/s with the pinned static ffmpeg (n8.1.2) — not the
+  provisional ~150 KB/s — so a 20 s L0 tail measured **5.33 MB > 4.0 MB ceiling** and would never publish.
+  Measured sizes at the adjusted rungs on the same worst-case fixture content: L0 = 3.71 MB, L1 = 2.64 MB,
+  L2 = 1.37 MB. The 15 s L0 stays within the RFC's resolved 15–20 s tail range; ceiling and ladder shape
+  unchanged (normative). Exact encode recipe and full measurement table: `game/toolchain.json`.
 
 ---
 
