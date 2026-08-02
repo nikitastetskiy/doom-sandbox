@@ -195,13 +195,19 @@ The publish gate must **affirmatively establish that the artifact is a well-form
 
 Gate order, all three required before publication:
 
-1. **Structural validity** — the file exists, is non-empty, and begins with the `GIF89a` magic bytes. May be enforced in the workflow or in the script, but must precede the size verdict.
+1. **Structural validity** — the file exists, is non-empty, and begins with the `GIF89a` magic bytes. May additionally be enforced in the workflow (where it fails faster and logs better), but `budget.py` enforces it **independently and unconditionally** before any size verdict — the script never assumes an upstream gate ran. Same defense-in-depth precedent as §5.5 rule 4.
 2. **Floor** — `size > floor_bytes` (§12).
 3. **Ceiling / ladder** — `size <= ceiling_bytes`, otherwise descend the ladder (§12).
 
 **Floor violation behavior**: `size <= floor_bytes` is a **hard failure — exit code 12, no publish, and no ladder descent**, regardless of the current rung. The ladder exists to make oversized output smaller; descending a rung on an undersized artifact makes it *smaller still*, which cannot repair it and merely burns encodes. A sub-floor artifact is evidence that the encode is broken (collapse, truncation, zero-length), not that it is mis-tuned. The run then takes the **pre-push failure** path of the write contract (§10): game state untouched, best-effort UNAVAILABLE swap, issues left open, next run retries.
 
-Emitted JSON on a hard failure carries `"hard_fail": true`, `"next": null`, and a `"reason"` of `"floor"` or `"ceiling"` so the workflow can branch and the operator can diagnose without reading logs. The floor is reported alongside the ceiling in the gate's output.
+**Structural failure behavior**: an artifact that is empty, or does not begin with `GIF89a`, is a **hard failure — exit code 13**, no publish, no ladder descent, `reason: "structure"`. It is deliberately *not* folded into the floor verdict, because **structural validity is orthogonal to size**. Folding would be correct only for the 0-byte case, where `0 <= floor_bytes` holds by coincidence; a *large* malformed artifact — a truncated GIF, or the wrong file entirely (a PNG, an HTML error page) — clears both floor and ceiling and would **publish**, which is the precise hole this section exists to close. It would also mislabel a 1.5 MB truncated file as a floor violation.
+
+A **nonexistent `--file` path remains a usage error (exit 2)**: that is a malformed invocation, not a malformed artifact.
+
+Operator meaning, and the reason these are separate integers: **13 = the encoder emitted garbage or the wrong file** (pipeline or toolchain fault); **12 = the encoder emitted a well-formed but degenerate clip** (palette or `pix_fmt` fault). Different first debugging step.
+
+Emitted JSON on a hard failure carries `"hard_fail": true`, `"next": null`, and a `"reason"` of `"structure"`, `"floor"`, or `"ceiling"` so the workflow can branch and the operator can diagnose without reading logs. The floor is reported alongside the ceiling in the gate's output.
 
 **Choosing 16,000 bytes.** Measured reference points: a legitimate single-frame still ≈ **46 KB**; a legitimate 18-frame clip ≈ **276 KB**; the recorded palette-collapse signature ≈ **a few KB** (GIF inter-frame differencing keeps a collapsed clip tiny no matter how many frames it holds, which is exactly why length is not a usable discriminator). 16,000 bytes sits near the geometric centre of that band — roughly 2x above the collapse signature and ~2.9x below the smallest legitimate artifact. Both error directions are loud rather than silent, but they are not symmetric: a false positive refuses one publish, turns the block UNAVAILABLE, alerts via the sweep, and self-heals on the next move; a false negative ships a blank frame to a visitor with everything upstream reporting success. The floor is therefore biased toward catching collapses. Re-verify if the ladder rungs or `pix_fmt` change.
 
