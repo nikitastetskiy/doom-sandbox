@@ -10,11 +10,35 @@
     "binary": "doomgeneric",
     "resolution": "640x400",
     "pixel_format": "bgra_alpha_zero",
+    "bootstrap_stream": ",,,,,,,,,,,,,,,x,,,e,,,e,,,e,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+    "bootstrap_frames": 70,
+    "bootstrap_note": "SPEC section 1: the fixed engine-invocation constant that carries the engine from boot into gameplay. No token expands to the menu keys e/x, so a ledger-derived stream holds only gameplay keys and NEVER leaves the title screen - prefixing this preamble is what makes a replay playable. 70 frames (~2.0 s at 35 tics/s): 15 idle, escape (x) to leave the title demo, three enters (e) walking New Game -> episode -> skill, then 45 idle frames for the screen wipe to settle. Carries NO trailing separator: it is a frame prefix, and the consumer supplies the comma that closes its last frame (doom.yml: printf '%s,').",
+    "bootstrap_provenance": "derived from game/tests/fixtures/golden.stream - the committed, empirically verified fixture whose replay reaches in-level gameplay - by game/scripts/extract_bootstrap.py, which takes every frame preceding the first gameplay input. Never hand-transcribed. Regenerate with `python3 game/scripts/extract_bootstrap.py`; audit the recorded value with `python3 game/scripts/extract_bootstrap.py --check`.",
+    "bootstrap_verified": "2026-08-02 - frame-level, on the macos-arm64 local build: bootstrap + expand(4-move ledger) renders a final frame that is in-level first-person gameplay with full HUD (AMMO 48 - down from the pistol's starting 50, so the fire moves actually discharged - HEALTH 100%, ARMOR 0%, weapon drawn). The identical gameplay stream WITHOUT the preamble exits 0, writes a byte-identical 35,840,000-byte capture, and ends on the Freedoom main menu - which is precisely why exit status and artifact size cannot verify this field.",
+    "build_cmd_linux": "make -f Makefile.dr CC=clang LDFLAGS=",
+    "build_cmd_linux_note": "The recorded build_cmd is macOS-only. Makefile.dr defaults CC=clang and LDFLAGS+=-Wl,-dead_strip; -dead_strip is an Apple-ld flag GNU ld refuses ('unable to disambiguate: -dead_strip'). Emptying LDFLAGS on the command line overrides the makefile's += and drops it. CC is deliberately still clang, NOT gcc: Makefile.dr's link recipe (line 38) hardcodes a bare -Wl after $(LIBS), which clang tolerates but gcc rejects outright ('unrecognized command-line option -Wl'), so CC=gcc cannot link this fork at all without patching it - and the fork is kept pristine (Ei L3 provenance). The trailing 'LDFLAGS=' is intentional and complete, not a truncation: it is an empty-value override. Consumed by .github/actions/doom-toolchain via `jq -r '.engine.build_cmd_linux // .engine.build_cmd'` and run under `eval`, so it must stay a single line.",
+    "build_toolchain_linux": {
+      "image": "ubuntu:24.04 (Ubuntu 24.04.4 LTS, amd64)",
+      "cc": "Ubuntu clang version 18.1.3 (1ubuntu1)",
+      "ld": "GNU ld (GNU Binutils for Ubuntu) 2.42",
+      "make": "GNU Make 4.3",
+      "libc6": "2.39-0ubuntu8.8",
+      "note": "CC and LDFLAGS change the resulting binary, so the compiler identity is part of the pin: a build SHA-256 without the toolchain that produced it under-specifies the build. If the ubuntu-24.04 runner's default `clang` is not 18.1.3 the hash below will differ - that is the reconciliation E7 task 1 must perform."
+    },
     "build_sha256": {
       "value": "40588a1662efc8e1634d067835d9cadd2de12fa5cb3e3d7e3238ada4a6d02eff",
       "status": "provisional_local",
       "platform": "macos-arm64 (apple clang)",
       "note": "canonical ubuntu-24.04 build SHA-256 is captured in E7 task 1 (plan D9) in one authorized update"
+    },
+    "build_sha256_linux": {
+      "value": "8ca27a6a03d4c37494ad56275ca54271c4942f7f112d42facc9332d445d1290c",
+      "status": "provisional_docker",
+      "platform": "linux-amd64 ELF 64-bit LSB pie executable, built from the pinned commit with build_cmd_linux",
+      "determinism": "PASS - two builds from the pinned commit in two different source paths (/w1, /w2) inside one ubuntu:24.04 container produced byte-identical binaries. Same double-run + SHA-256 byte-agreement shape used for the E2 replay proof.",
+      "runtime_verified": "2026-08-02 - the Linux binary replayed bootstrap_stream + expand(4-move ledger) to exit 0 and a 35,840,000-byte capture whose final frame is in-level gameplay (frame grab inspected, full HUD).",
+      "cross_platform_frame_agreement": "the ENTIRE 35-frame / 35,840,000-byte capture is byte-identical to the one produced by the macos-arm64 build from the same input (final-frame SHA-256 38ee759839b22cb0402a6c9c10d3916825ad6ec487c48f3cff5a635d1ab8ec48 on both). This is direct evidence for plan D9's assumption that the framebuffer agrees cross-platform (fixed-point DOOM math) - the BINARY hash is platform-specific, the RENDERED FRAMES are not.",
+      "note": "PROVISIONAL, not canonical. Produced in Docker on ubuntu:24.04 linux/amd64 under qemu emulation on an arm64 host - not on a real GitHub ubuntu-24.04 runner, whose default clang may differ from 18.1.3. E7 task 1 owns the canonical capture (plan D9) and promotes the confirmed value into build_sha256; this field is the reproducible reference to reconcile against, and must not be read as pre-empting it. Nothing in CI reads this field: .github/actions/doom-toolchain still reads .engine.build_sha256.value/.status, which remain untouched."
     }
   },
   "wad": {
