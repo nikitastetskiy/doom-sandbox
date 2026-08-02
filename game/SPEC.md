@@ -66,7 +66,7 @@ One line, space-delimited, exactly 6 fields:
 
 - `<n>`: section number, decimal, starts at 1, strictly increasing by 1.
 - `engine=`: immutable engine commit SHA (40 lowercase hex). `build=`: engine build-artifact SHA-256. `wad=`: `freedoom1.wad` SHA-256 (both 64 lowercase hex). `mapping=`: mapping version (this spec: `1`).
-- Any mismatch between the current section's header pins and the running toolchain ⇒ **refuse to run** (RFC determinism guarantees).
+- Any mismatch between the current section's header pins and the running toolchain ⇒ the section is **sealed**: refuse to advance it. The one sanctioned in-band exception is the zero-frame rollover defined in **§5.5**, which is what keeps the RFC's "engine bump ⇒ forced `new game`" reachable without an operator.
 
 ### 5.3 Ledger line grammar
 
@@ -90,11 +90,31 @@ doomreplay input format: frames separated by `,`; a frame is zero or more key ch
 - Stream generation: concatenate each ledger line's expansion (frames × count) in ledger order, joined with single `,`; **no inter-move padding frames**.
 - Worked example: ledger lines `fire 1` then `turn-left 2` ⇒ `f,f,f,f,f,f,f,f,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l` (8 + 20 = **28 frames, 27 commas**).
 
+### 5.5 Pin mismatch: sealed sections and the sanctioned zero-frame rollover (normative)
+
+A section is **sealed** when any field of its header (`engine`, `build`, `wad`, `mapping`) does not match the running toolchain. Sealing is computed at run time by comparing the current section's header against `game/toolchain.json`; it is never configured or stored.
+
+**Why this rule exists.** §5.2 requires refusal on a pin mismatch; the RFC requires an engine (or mapping) bump to force a `new game`. Because §5.3 places the `new-game` directive as the **last line of the closing section**, a literal refusal would block the very recovery the RFC prescribes, leaving the game permanently unable to advance without a human hand-editing committed state. The rule below satisfies both.
+
+**The rule.**
+
+1. **Sealed sections never advance and are never re-simulated.** No line that contributes frames may be appended to a sealed section. Its `stream.txt` is not regenerated and the section is not replayed while sealed. Its committed pins are preserved verbatim — a sealed section always remains reproducible against the archived build that produced it.
+2. **The sole admissible move is `doom: new game`.** It contributes **zero frames** (§1), so it provably cannot alter the sealed section's replay output and therefore cannot fork the timeline. It is appended as that section's final line, and the next section header is written with the **running** toolchain's pins — this is the only legitimate way a pin change enters the log.
+3. **Everything else is rejected, not fatal.** In sealed mode the drain closes every other valid move with the fixed message **`the arcade is being upgraded — press New game to continue`** (verbatim, no interpolation) and the `sealed` reason code — the same mechanics already used at the section cap (§6, `log full`). Rejection, not run failure, is required: refusing the batch would livelock the loop, because the drain processes issues in ascending number order, so a lower-numbered frame-contributing issue would be re-drained and re-refused on every subsequent run, forever.
+4. **Defense in depth.** `game/scripts/apply_moves.py` independently enforces invariant 1: if any frame-contributing line would land in a sealed section it **refuses with exit code 7** and leaves the ledger byte-unchanged, even though correct drain behavior means it should never see such a batch. A frame-contributing move ordered *ahead* of a reset in the same batch is refused by this path.
+5. **Moves after the rollover apply normally.** Once the reset opens a fresh section, that section's pins match the running toolchain by construction, so later moves in the same batch land in it and are simulated normally.
+6. **Recovery is always reachable**: the `new game` cooldown (§6) does **not** apply while the current section is sealed. A sealed game cannot advance, so the cooldown's purpose — preventing reset-griefing of a live game — is inapplicable, and a visitor cannot induce a mismatch (pins change only through a default-branch commit).
+7. **Player-visible state.** While sealed, the README game block shows the **SEALED** guidance screen (§11). A run whose drained moves are all sealed-rejects is a **successful run with zero ledger appends**: it performs a display-only swap to SEALED and commits no game state (§10).
+
+**Rollover recovery render.** The fresh section is empty, so the recovery run replays zero frames and renders the game-start view — the same path already exercised by the initial committed state (§5.1).
+
+**Alternative considered and rejected.** Moving the `new-game` directive to the *first* line of the opening section would dissolve the contradiction without an exception. Rejected: it rewrites the §5.3 serialization contract that committed tests and implementation already encode, it degrades the audit trail (the new section's first line would describe an event that preceded its existence), and it does not remove the need for degraded-mode handling of frame-contributing moves anyway.
+
 ## 6. Knob values (RFC OQ5 — resolved here, not post-launch)
 
 | Knob | Value | Notes |
 |---|---|---|
-| `new game` cooldown (RFC D16) | **30 minutes** | Resets within 30 min of the last applied reset are rejected with the fixed message |
+| `new game` cooldown (RFC D16) | **30 minutes** | Resets within 30 min of the last applied reset are rejected with the fixed message. **Does not apply while the current section is sealed** (§5.5 rule 6) — the sanctioned rollover is always immediately reachable |
 | Per-user move cooldown | **0 (disabled in v1)** | Valid-move floods are "someone playing"; drain amortizes. Knob exists in config, default off |
 | Per-run drain cap | **20 issues** | ≈ 60 receipt writes worst case — under the 80/min secondary content-write limit |
 | Log-section cap | **120,000 expanded frames** (unit: engine frames ≈ 57 min gameplay) | At cap, only `doom: new game` is accepted; others get the fixed guidance comment ("log full — start a new game") |
@@ -135,12 +155,15 @@ Copied from RFC 001 ("Failure-path write contract", normative there), with the g
 | Post-push failure (close/receipt/reaction) | Landed | Landed | **Already LIVE — never overwritten** | Closed next run as close-only cleanup (idempotency key) | Automatic, next run |
 | Runner loss / cancelation / infra kill | Untouched | Untouched | No step runs ⇒ no swap; prior frame remains accurate | Left open | Sweep or next move |
 
+Degraded-mode note (§5.5, §6 cap): a run whose drained moves are **all** rejected — every move sealed-rejected, or cap-rejected at the section cap — is a **success** outcome with zero ledger appends and no GIF publish. It closes the rejected issues with their fixed guidance message and performs a display-only swap to SEALED or LOG_FULL. It is not a failure row above: nothing failed, and no game state was eligible to change.
+
 ## 11. State screens (v1)
 
 - **LIVE** — the game GIF (normal state after a move).
 - **PAUSED** — default "press play" idle state (swapped by the sweep after inactivity, well before the 60-day scheduled-workflow auto-disable).
 - **UNAVAILABLE** — failure/limit guard. Semantics: **"moves are not being processed right now"** — not "the frame is wrong"; an untouched prior frame is still accurate history.
-- **LOG-FULL guidance** — shown at the section cap: only `doom: new game` accepted.
+- **LOG-FULL guidance** (`LOG_FULL`) — shown at the section cap: only `doom: new game` accepted.
+- **SEALED guidance** (`SEALED`) — shown while the current section is sealed by a pin mismatch (§5.5): only `doom: new game` accepted, and it is exempt from the cooldown. Distinct from UNAVAILABLE (moves *are* being processed) and from LOG_FULL (the section is not full — its toolchain moved). Adds one rewriter state value, one screen asset, and one drain reason code, parallel to LOG_FULL in every respect.
 - **LOADING** — defined but **off by default in v1** (costs an extra push per move).
 
 ## 12. GIF budget constants (RFC D7)
