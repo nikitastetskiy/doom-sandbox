@@ -53,7 +53,7 @@ Common rules: **ASCII (UTF-8 subset), LF newlines, files end with exactly one tr
 
 ### 5.1 Files
 
-- `game/state/log.txt` — **the authoritative game state** (RFC D13): a sequence of sections; each section = one header line followed by zero or more ledger lines. Append-only; sections are never truncated or rewritten. A section with zero ledger lines is valid (fresh game).
+- `game/state/log.txt` — **the authoritative game state** (RFC D13): a sequence of sections; each section = one header line followed by zero or more ledger lines. Append-only; sections are never truncated or rewritten — one narrow, human-authored exception in **§5.6**, which applies only to a section nobody has played. A section with zero ledger lines is valid (fresh game).
 - `game/state/stream.txt` — **derived artifact**: the doomreplay input stream for the **current section only**, regenerated from the ledger on every run (`stream == expand(ledger, mapping_version)` is a CI invariant; on mismatch the stream is regenerated — the ledger wins). Empty section ⇒ empty stream file (zero frames, no commas, single LF).
 
 ### 5.2 Section header grammar
@@ -109,6 +109,21 @@ A section is **sealed** when any field of its header (`engine`, `build`, `wad`, 
 **Rollover recovery render.** The fresh section is empty, so the recovery run replays zero frames and renders the game-start view — the same path already exercised by the initial committed state (§5.1).
 
 **Alternative considered and rejected.** Moving the `new-game` directive to the *first* line of the opening section would dissolve the contradiction without an exception. Rejected: it rewrites the §5.3 serialization contract that committed tests and implementation already encode, it degrades the audit trail (the new section's first line would describe an event that preceded its existence), and it does not remove the need for degraded-mode handling of frame-contributing moves anyway.
+
+### 5.6 Authoring exception: re-initializing an entry-less section (normative)
+
+A section with **zero ledger lines** contains no player history: its replay output is empty under any pins, so rewriting its header rewrites nothing anyone played and cannot alter any rendered frame. For that section only, the header may be **re-initialized in place** — pin fields updated, section number preserved, no new section created.
+
+Strictly bounded:
+
+1. **Human-authored only — never a runtime behavior.** The workflow, drain, and `apply_moves.py` must never re-initialize a header. Their only recovery is the §5.5 rollover, so the automated path stays single-pathed and self-healing.
+2. **Preconditions, all required**: the target section has zero ledger lines **and** is the last section in the file. Otherwise the §5.5 rollover applies.
+3. **Authorized commit.** Re-initialization lands in an explicit, reviewed commit that also updates the toolchain pins it is aligning to — the header and `game/toolchain.json` move together, or the run that follows is sealed again for the same reason.
+4. **The append-only guarantee is unweakened.** It exists to protect played history; an entry-less section has none. No section that ever held a ledger line may be rewritten, ever.
+
+**First application (plan D9 / step E7).** The committed section 1 is entry-less and carries a provisional macOS `build=` hash, so the first `ubuntu-24.04` run seals it on the `build` field before any move can apply. The canonical capture re-initializes that header in the same authorized commit that records the canonical build hash in `game/toolchain.json`. Preferred over burning a rollover: it keeps section numbering meaningful (a section 2 here would record "the toolchain changed before anyone played"), and it spares the profile's first-ever visitor a rejection message.
+
+**The rollover remains the guarantee.** If an entry-less section is ever left un-re-initialized — at cutover or after any future bump — §5.5 still heals it in band without an operator. §5.6 is an optimization for the authoring case, never a dependency.
 
 ## 6. Knob values (RFC OQ5 — resolved here, not post-launch)
 
