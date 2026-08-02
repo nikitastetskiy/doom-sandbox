@@ -1,0 +1,218 @@
+# Shared toolchain restore for doom.yml and ci.yml.
+#
+# RFC 001 "Executable integrity" (security #10) / D12, implemented once:
+#   - exact-match cache keys ONLY, no restore-keys fallback (a stale binary
+#     restored through a prefix fallback would bypass the section-header pin);
+#   - the runner image label is part of every key;
+#   - every restored or downloaded executable is SHA-256 verified BEFORE it is
+#     executed, and a mismatch rebuilds from pinned source -- fail closed to
+#     the source build, never to the artifact;
+#   - build-on-miss is a first-class path (actions/cache evicts after ~7 idle
+#     days, and this game can idle for weeks);
+#   - ffmpeg is NEVER apt-get'd (verified absent from ubuntu-24.04, and apt
+#     costs 20-40 s/run): it is the checksum-pinned static build recorded in
+#     game/toolchain.json.
+#
+# Requires the caller to have checked out game/toolchain.json already.
+name: DOOM toolchain
+description: Restore, verify, or rebuild the pinned doomreplay engine and static ffmpeg from game/toolchain.json.
+
+inputs:
+  need-ffmpeg:
+    description: Set to 'false' to skip the ffmpeg half (the golden-frame test only needs the engine).
+    required: false
+    default: 'true'
+
+outputs:
+  engine-bin:
+    description: Absolute path to the verified doomreplay binary.
+    value: ${{ steps.engine.outputs.bin }}
+  engine-build-sha256:
+    description: SHA-256 of the engine binary actually used by this job (the plan D9 capture value).
+    value: ${{ steps.engine.outputs.build-sha256 }}
+  ffmpeg-bin:
+    description: Absolute path to the verified static ffmpeg binary (empty when need-ffmpeg is 'false').
+    value: ${{ steps.ffmpeg.outputs.bin }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve pins from game/toolchain.json
+      id: pins
+      shell: bash
+      run: |
+        set -euo pipefail
+        tc=game/toolchain.json
+        test -f "$tc" || { echo "::error::$tc is missing - checkout it before this action"; exit 1; }
+
+        {
+          echo "engine-repo=$(jq -r '.engine.repo' "$tc")"
+          echo "engine-sha=$(jq -r '.engine.commit_sha' "$tc")"
+          echo "engine-build-dir=$(jq -r '.engine.build_dir' "$tc")"
+          # build_cmd_linux is preferred when present: the recorded build_cmd is
+          # the macOS-local one (CC=clang plus the Apple-only -dead_strip link
+          # flag). See the E5 report - the Linux build command is a determinism
+          # pin and belongs in game/toolchain.json, not in this YAML.
+          echo "engine-build-cmd=$(jq -r '.engine.build_cmd_linux // .engine.build_cmd' "$tc")"
+          echo "engine-binary=$(jq -r '.engine.binary' "$tc")"
+          echo "engine-build-sha256=$(jq -r '.engine.build_sha256.value' "$tc")"
+          echo "engine-pin-status=$(jq -r '.engine.build_sha256.status' "$tc")"
+          echo "runner-image=$(jq -r '.runner_image' "$tc")"
+          echo "ffmpeg-url=$(jq -r '.ffmpeg.url' "$tc")"
+          echo "ffmpeg-tag=$(jq -r '.ffmpeg.release_tag' "$tc")"
+          echo "ffmpeg-tarball-sha256=$(jq -r '.ffmpeg.tarball_sha256' "$tc")"
+          echo "ffmpeg-binary-path=$(jq -r '.ffmpeg.binary_path_in_tarball' "$tc")"
+          echo "ffmpeg-binary-sha256=$(jq -r '.ffmpeg.binary_sha256' "$tc")"
+        } >> "$GITHUB_OUTPUT"
+
+    # --- ffmpeg: pinned static build, exact-key cache, verify before execute ---
+
+    - name: Restore pinned static ffmpeg
+      id: ffmpeg-cache
+      if: inputs.need-ffmpeg == 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/doom-toolchain/ffmpeg
+        # Exact match only. No restore-keys: the key carries the expected
+        # SHA-256, so a hit is already an assertion about the bytes.
+        key: doom-ffmpeg-${{ steps.pins.outputs.runner-image }}-${{ steps.pins.outputs.ffmpeg-tag }}-${{ steps.pins.outputs.ffmpeg-binary-sha256 }}-v1
+        enableCrossOsArchive: false
+
+    - name: Verify or fetch ffmpeg
+      id: ffmpeg
+      if: inputs.need-ffmpeg == 'true'
+      shell: bash
+      env:
+        FFMPEG_DIR: ${{ runner.temp }}/doom-toolchain/ffmpeg
+        FFMPEG_URL: ${{ steps.pins.outputs.ffmpeg-url }}
+        FFMPEG_TARBALL_SHA256: ${{ steps.pins.outputs.ffmpeg-tarball-sha256 }}
+        FFMPEG_BINARY_PATH: ${{ steps.pins.outputs.ffmpeg-binary-path }}
+        FFMPEG_BINARY_SHA256: ${{ steps.pins.outputs.ffmpeg-binary-sha256 }}
+      run: |
+        set -euo pipefail
+        bin="${FFMPEG_DIR}/ffmpeg"
+
+        verify() {
+          test -x "$1" || return 1
+          echo "${FFMPEG_BINARY_SHA256}  $1" | sha256sum --check --status
+        }
+
+        if verify "$bin"; then
+          echo "ffmpeg restored from cache and verified against the recorded SHA-256"
+        else
+          # Fail closed to a fresh, checksum-pinned download. Never apt-get,
+          # and never trust the restored artifact after a mismatch.
+          echo "::notice::ffmpeg cache miss or checksum mismatch - refetching the pinned static build"
+          rm -rf "${FFMPEG_DIR}"
+          mkdir -p "${FFMPEG_DIR}"
+          tarball="${RUNNER_TEMP}/ffmpeg.tar.xz"
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            --output "$tarball" -- "${FFMPEG_URL}"
+          echo "${FFMPEG_TARBALL_SHA256}  ${tarball}" | sha256sum --check --status
+          tar -xJf "$tarball" -C "${RUNNER_TEMP}" -- "${FFMPEG_BINARY_PATH}"
+          mv "${RUNNER_TEMP}/${FFMPEG_BINARY_PATH}" "$bin"
+          chmod +x "$bin"
+          rm -f "$tarball"
+          verify "$bin" || { echo "::error::pinned ffmpeg failed SHA-256 verification after download"; exit 1; }
+        fi
+
+        "$bin" -hide_banner -version | head -n 1
+        echo "bin=${bin}" >> "$GITHUB_OUTPUT"
+
+    - name: Save pinned static ffmpeg
+      if: inputs.need-ffmpeg == 'true' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/doom-toolchain/ffmpeg
+        key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+        enableCrossOsArchive: false
+
+    # --- engine: pinned fork + commit, exact-key cache, verify before execute ---
+
+    - name: Restore pinned engine build
+      id: engine-cache
+      # While the recorded build hash is still the provisional macOS value
+      # (plan D9), there is nothing to verify a restored Linux binary against,
+      # so the cache is bypassed entirely and every run builds from source.
+      # E7 task 1 captures the canonical ubuntu-24.04 hash and this turns on.
+      if: steps.pins.outputs.engine-pin-status == 'canonical'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/doom-toolchain/engine
+        key: doom-engine-${{ steps.pins.outputs.runner-image }}-${{ steps.pins.outputs.engine-sha }}-${{ steps.pins.outputs.engine-build-sha256 }}-v1
+        enableCrossOsArchive: false
+
+    - name: Verify or rebuild the engine
+      id: engine
+      shell: bash
+      env:
+        ENGINE_DIR: ${{ runner.temp }}/doom-toolchain/engine
+        ENGINE_REPO: ${{ steps.pins.outputs.engine-repo }}
+        ENGINE_SHA: ${{ steps.pins.outputs.engine-sha }}
+        ENGINE_BUILD_DIR: ${{ steps.pins.outputs.engine-build-dir }}
+        ENGINE_BUILD_CMD: ${{ steps.pins.outputs.engine-build-cmd }}
+        ENGINE_BINARY: ${{ steps.pins.outputs.engine-binary }}
+        ENGINE_BUILD_SHA256: ${{ steps.pins.outputs.engine-build-sha256 }}
+        ENGINE_PIN_STATUS: ${{ steps.pins.outputs.engine-pin-status }}
+      run: |
+        set -euo pipefail
+        bin="${ENGINE_DIR}/doomgeneric"
+
+        verify() {
+          test -x "$1" || return 1
+          echo "${ENGINE_BUILD_SHA256}  $1" | sha256sum --check --status
+        }
+
+        if [ "${ENGINE_PIN_STATUS}" = "canonical" ] && verify "$bin"; then
+          echo "engine restored from cache and verified against the recorded SHA-256"
+        else
+          if [ "${ENGINE_PIN_STATUS}" != "canonical" ]; then
+            echo "::notice::engine build hash is '${ENGINE_PIN_STATUS}' - building from pinned source and reporting the computed hash (plan D9 capture)"
+          else
+            echo "::notice::engine cache miss or checksum mismatch - rebuilding from the pinned commit (fail closed to source build)"
+          fi
+          rm -rf "${ENGINE_DIR}"
+          mkdir -p "${ENGINE_DIR}"
+          src="${RUNNER_TEMP}/doom-engine-src"
+          rm -rf "$src"
+          mkdir -p "$src"
+          git init --quiet "$src"
+          git -C "$src" remote add origin "${ENGINE_REPO}"
+          git -C "$src" fetch --quiet --depth 1 origin "${ENGINE_SHA}"
+          git -C "$src" checkout --quiet FETCH_HEAD
+          head_sha="$(git -C "$src" rev-parse HEAD)"
+          if [ "$head_sha" != "${ENGINE_SHA}" ]; then
+            echo "::error::engine checkout is ${head_sha}, expected the pinned ${ENGINE_SHA}"
+            exit 1
+          fi
+          ( cd "${src}/${ENGINE_BUILD_DIR}" && eval "${ENGINE_BUILD_CMD}" )
+          cp "${src}/${ENGINE_BUILD_DIR}/${ENGINE_BINARY}" "$bin"
+          chmod +x "$bin"
+          if [ "${ENGINE_PIN_STATUS}" = "canonical" ]; then
+            verify "$bin" || {
+              echo "::error::engine rebuilt from the pinned commit does not match the recorded build SHA-256 - determinism pin broken"
+              exit 1
+            }
+          fi
+        fi
+
+        built="$(sha256sum "$bin" | cut -d' ' -f1)"
+        echo "bin=${bin}" >> "$GITHUB_OUTPUT"
+        echo "build-sha256=${built}" >> "$GITHUB_OUTPUT"
+        {
+          echo "### DOOM engine"
+          echo ""
+          echo "| field | value |"
+          echo "| --- | --- |"
+          echo "| pinned commit | \`${ENGINE_SHA}\` |"
+          echo "| recorded build SHA-256 | \`${ENGINE_BUILD_SHA256}\` (${ENGINE_PIN_STATUS}) |"
+          echo "| built SHA-256 (this run) | \`${built}\` |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Save pinned engine build
+      if: steps.pins.outputs.engine-pin-status == 'canonical' && steps.engine-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/doom-toolchain/engine
+        key: ${{ steps.engine-cache.outputs.cache-primary-key }}
+        enableCrossOsArchive: false

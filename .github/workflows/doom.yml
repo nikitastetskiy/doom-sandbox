@@ -1,0 +1,709 @@
+# Playable DOOM in the profile README - the move loop.
+#
+# RFC 001 component 5. The workflow is a THIN ORCHESTRATOR: every piece of game
+# logic lives in the checked-in, unit-tested scripts under game/scripts/. The
+# only things this file decides are ordering, permissions, and failure class.
+#
+# Hard invariants enforced here (each is grep-checkable):
+#   - runs-on is the pinned ubuntu-24.04 label, never ubuntu-latest (the 26.04
+#     image is in public preview and the alias will migrate underneath us; the
+#     runner image is a determinism dependency - D12).
+#   - github.event.issue.title appears ONLY inside `if:` expressions. It is
+#     never interpolated into a `run:` block and never written to GITHUB_ENV or
+#     GITHUB_OUTPUT (security #2). `if:` expressions are not a shell-injection
+#     surface; run-block interpolation is, and it is forbidden.
+#   - The gate is expression-native only (startsWith + contains/fromJSON set
+#     membership - D15). Actions expressions have no regex function; a shell
+#     regex shim would be exactly the template-injection RCE. The anchored,
+#     byte-exact, ASCII-only match lives in game/scripts/parse_title.py, which
+#     reads the title from a JSON file - never argv, never a shell.
+#   - No `secrets.` reference anywhere: the default GITHUB_TOKEN, reached via
+#     ${{ github.token }}, is the entire credential surface (D8). Its pushes
+#     cannot retrigger this workflow, which is the loop guard.
+#   - Per-job least privilege; the workflow default is no permissions at all.
+#   - One concurrency group for every game-state writer, cancel-in-progress
+#     false. Correctness comes from the drain invariant, not from queueing.
+#
+# The drain invariant (RFC, named and load-bearing): every run re-reads all
+# pending input from the API and never trusts its own event payload. That is
+# what makes coalescing-cancelation, sweeps and manual re-runs re-entrant.
+
+name: doom
+
+on:
+  issues:
+    types: [opened]
+  # SPEC section 6 knob `sweep_cron`: every 6 h at :17, an off-peak minute
+  # (schedule delivery can lag 10+ minutes at busy cron windows - fine for a
+  # safety net). The sweep no-ops cheaply when there is no pending input.
+  schedule:
+    - cron: '17 */6 * * *'
+  # The operator entry point: drain/re-render, UNAVAILABLE recovery, and the
+  # pre-merge rehearsal path. See game/RUNBOOK.md.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run the full drain and parse path with every push, close and receipt disabled.
+        type: boolean
+        default: false
+      simulate_title:
+        description: Extra synthetic issue title to push through the drain. Honored only when dry_run is true.
+        type: string
+        default: ''
+
+# Everything else none (security #4). Each job opts in to exactly what it needs.
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Same fixed string as REJECT_MESSAGES['unlisted-token'] in
+  # game/scripts/parse_title.py. The gate job has no checkout by design, so it
+  # cannot call the parser; this is the one deliberate duplication of a
+  # visitor-facing string in the pipeline.
+  REJECT_MESSAGE: 'unrecognized command — use one of the control links in the README'
+  INVALID_LABEL: invalid-move
+  MAINTENANCE_LABEL: doom-maintenance
+  # Inactivity threshold for the PAUSED swap. "Well before day 60" (the
+  # scheduled-workflow auto-disable horizon) - not a SPEC knob, chosen here;
+  # see the E5 report. The swap is also the repo activity that keeps the
+  # schedule alive, but do not rely on that: game/RUNBOOK.md documents the
+  # manual `gh workflow enable` re-arm.
+  IDLE_PAUSE_DAYS: '45'
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Gate: closes issues that look like a move but are not one.
+  #
+  # This job starts ONLY for a `doom: `-prefixed title that is not an exact
+  # member of the 56 canonical literals, so valid moves never pay for it and
+  # invalid ones never reach the heavy job - spend per troll is a one-minute,
+  # checkout-free job. It is deliberately NOT in the game-state concurrency
+  # group: it touches no game state, and serializing it behind a render would
+  # delay reject feedback for no benefit.
+  #
+  # The set literal below is generated verbatim from game/mapping/v1.json:
+  #   jq -c .canonical_titles game/mapping/v1.json
+  # Note honestly: Actions expression comparisons are case-insensitive, so
+  # `DOOM: Forward` passes both startsWith and contains here and is handed to
+  # the heavy job, where the byte-exact parser declines to consume it and the
+  # issue is left open like any other non-command issue. There is no
+  # case-sensitive primitive in the expression language; see the E5 report.
+  # --------------------------------------------------------------------------
+  gate:
+    name: Gate (close non-canonical move issues)
+    if: >-
+      github.event_name == 'issues'
+      && startsWith(github.event.issue.title, 'doom: ')
+      && !contains(fromJSON('["doom: forward","doom: forward x2","doom: forward x3","doom: forward x4","doom: forward x5","doom: forward x6","doom: forward x7","doom: forward x8","doom: forward x9","doom: back","doom: back x2","doom: back x3","doom: back x4","doom: back x5","doom: back x6","doom: back x7","doom: back x8","doom: back x9","doom: turn-left","doom: turn-left x2","doom: turn-left x3","doom: turn-left x4","doom: turn-left x5","doom: turn-left x6","doom: turn-left x7","doom: turn-left x8","doom: turn-left x9","doom: turn-right","doom: turn-right x2","doom: turn-right x3","doom: turn-right x4","doom: turn-right x5","doom: turn-right x6","doom: turn-right x7","doom: turn-right x8","doom: turn-right x9","doom: fire","doom: fire x2","doom: fire x3","doom: fire x4","doom: fire x5","doom: fire x6","doom: fire x7","doom: fire x8","doom: fire x9","doom: use","doom: run-forward","doom: run-forward x2","doom: run-forward x3","doom: run-forward x4","doom: run-forward x5","doom: run-forward x6","doom: run-forward x7","doom: run-forward x8","doom: run-forward x9","doom: new game"]'), github.event.issue.title)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    permissions:
+      # Nothing else: no checkout, no `contents` at all, so this job structurally
+      # cannot touch game state.
+      issues: write # comment, label and close the offending issue
+    concurrency:
+      # Deliberately NOT the game-state group - rejecting a bad title must not
+      # queue behind a render. Per-issue, so two bad issues reject in parallel.
+      group: doom-gate-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Label and close with the fixed rejection message
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The issue NUMBER (an integer chosen by GitHub) is the only piece of
+          # event data this job needs. The title never crosses into the script.
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          api="repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}"
+
+          # Idempotent label bootstrap; a 422 here means it already exists.
+          jq -n --arg name "${INVALID_LABEL}" \
+            '{name: $name, color: "b60205", description: "A doom: issue that is not a canonical move"}' \
+            | gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/labels" --input - || true
+
+          jq -n --arg body "${REJECT_MESSAGE}" '{body: $body}' \
+            | gh api --silent -X POST "${api}/comments" --input -
+          jq -n --arg name "${INVALID_LABEL}" '{labels: [$name]}' \
+            | gh api --silent -X POST "${api}/labels" --input -
+          jq -n '{state: "closed", state_reason: "not_planned"}' \
+            | gh api --silent -X PATCH "${api}" --input -
+
+  # --------------------------------------------------------------------------
+  # Play: the heavy job. Drain -> apply -> simulate -> encode -> rewrite ->
+  # publish -> close, plus the scheduled sweep duties.
+  #
+  # No `needs:` on the gate job on purpose: the two are mutually exclusive, and
+  # chaining them would put a second runner pickup (10-60 s, the dominant term
+  # in the latency budget) on the critical path of every real move.
+  # --------------------------------------------------------------------------
+  play:
+    name: Play (drain, simulate, encode, publish)
+    if: >-
+      github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+      || contains(fromJSON('["doom: forward","doom: forward x2","doom: forward x3","doom: forward x4","doom: forward x5","doom: forward x6","doom: forward x7","doom: forward x8","doom: forward x9","doom: back","doom: back x2","doom: back x3","doom: back x4","doom: back x5","doom: back x6","doom: back x7","doom: back x8","doom: back x9","doom: turn-left","doom: turn-left x2","doom: turn-left x3","doom: turn-left x4","doom: turn-left x5","doom: turn-left x6","doom: turn-left x7","doom: turn-left x8","doom: turn-left x9","doom: turn-right","doom: turn-right x2","doom: turn-right x3","doom: turn-right x4","doom: turn-right x5","doom: turn-right x6","doom: turn-right x7","doom: turn-right x8","doom: turn-right x9","doom: fire","doom: fire x2","doom: fire x3","doom: fire x4","doom: fire x5","doom: fire x6","doom: fire x7","doom: fire x8","doom: fire x9","doom: use","doom: run-forward","doom: run-forward x2","doom: run-forward x3","doom: run-forward x4","doom: run-forward x5","doom: run-forward x6","doom: run-forward x7","doom: run-forward x8","doom: run-forward x9","doom: new game"]'), github.event.issue.title)
+    runs-on: ubuntu-24.04
+    # A hung run (stuck ffmpeg pipe, wedged push retry) must not hold the game's
+    # concurrency group for the 6 h default.
+    timeout-minutes: 10
+    permissions:
+      contents: write # commit ledger/stream/README, force the GIF to the output branch
+      issues: write # close drained issues and post the receipts from the drain plan
+    concurrency:
+      # One group for every writer - event runs, the sweep and manual dispatch.
+      # This, not the queue, is the global serialization bound.
+      group: doom-game-state
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DRY_RUN: ${{ inputs.dry_run == true }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      LEDGER: game/state/log.txt
+      STREAM: game/state/stream.txt
+      MAPPING: game/mapping/v1.json
+      TOOLCHAIN: game/toolchain.json
+      # Cutover flag (plan D5). The control table ships DISABLED and is
+      # switched on last, in one reviewable commit, at E9 stage 2. Every
+      # render in this workflow honours it, so the committed block and the
+      # rendered block can never disagree about whether controls are live.
+      CONTROLS_ENABLED: 'false'
+      # Relative repo paths, matching what E6 committed and the convention
+      # of the profile's existing octocat.gif. State screens are static
+      # committed assets, so they need no ?run= buster: a swap changes the
+      # filename, which is already a fresh Camo cache key. Only the GIF -
+      # which lives on the force-pushed output branch under one fixed name -
+      # needs the buster (D5/D10).
+      SCREEN_PAUSED: game/assets/screens/paused.png
+      SCREEN_UNAVAILABLE: game/assets/screens/unavailable.png
+    steps:
+      - name: Checkout game state
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          # The pushes below ride the checkout's credential helper; no token is
+          # ever written into a command line or a remote URL.
+          #
+          # zizmor's `artipacked` audit flags this at the auditor persona (it is
+          # clean at the default and pedantic personas): persisted credentials
+          # leak only through an artifact upload of the .git directory, and this
+          # repository uploads no artifacts from any workflow. The alternative -
+          # an explicit token in a remote URL - is strictly worse. Deliberate.
+          persist-credentials: true
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            .github
+            game
+            README.md
+
+      - name: Configure the committer identity
+        run: |
+          set -euo pipefail
+          # Fixed bot identity. Player handles are never written into a commit
+          # message (mention-spam vector, security #3).
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      # --- scheduled sweep guard: abuse volume, owner alerting, idleness ------
+
+      - name: Sweep guard (abuse volume, owner alerting, idleness)
+        id: guard
+        if: github.event_name == 'schedule'
+        run: |
+          set -euo pipefail
+          runs_api="repos/${GITHUB_REPOSITORY}/actions/workflows/doom.yml/runs"
+          since="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Trailing-24h run volume (SPEC section 6: 200 runs / 24 h).
+          threshold="$(jq -r '.knobs.abuse_trailing_24h_run_threshold' "${MAPPING}")"
+          volume="$(gh api -X GET "${runs_api}" -f "created=>${since}" -F per_page=1 --jq '.total_count')"
+
+          # Consecutive failed move runs (SPEC section 6: 2).
+          fail_threshold="$(jq -r '.knobs.sweep_owner_alert_consecutive_failures' "${MAPPING}")"
+          failures="$(gh api -X GET "${runs_api}" -f status=completed -F per_page=10 \
+            --jq '[.workflow_runs[].conclusion] | (map(. == "failure") | index(false) // length)')"
+
+          # Days since the last game-state commit.
+          last="$(gh api -X GET "repos/${GITHUB_REPOSITORY}/commits" \
+            -f "path=${LEDGER}" -F per_page=1 --jq '.[0].commit.committer.date // empty')"
+          if [ -n "$last" ]; then
+            idle_days=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 86400 ))
+          else
+            idle_days=0
+          fi
+
+          halt=false
+          if [ "$volume" -gt "$threshold" ]; then halt=true; fi
+          idle=false
+          if [ "$idle_days" -ge "${IDLE_PAUSE_DAYS}" ]; then idle=true; fi
+
+          {
+            echo "halt=${halt}"
+            echo "idle=${idle}"
+            echo "alert=$( [ "$failures" -ge "$fail_threshold" ] && echo true || echo false )"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Sweep guard"
+            echo ""
+            echo "- trailing-24h runs: ${volume} (threshold ${threshold}) -> halt=${halt}"
+            echo "- consecutive failed runs: ${failures} (threshold ${fail_threshold})"
+            echo "- days since last game-state commit: ${idle_days} (threshold ${IDLE_PAUSE_DAYS}) -> idle=${idle}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Alert the owner
+        if: steps.guard.outputs.alert == 'true' || steps.guard.outputs.halt == 'true'
+        env:
+          HALTED: ${{ steps.guard.outputs.halt }}
+        run: |
+          set -euo pipefail
+          # Workflow-failure notifications go to the triggering visitor, not to
+          # the owner - so the sweep opens/updates a maintenance issue instead.
+          jq -n --arg name "${MAINTENANCE_LABEL}" \
+            '{name: $name, color: "d93f0b", description: "DOOM pipeline needs operator attention"}' \
+            | gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/labels" --input - || true
+
+          existing="$(gh api -X GET "repos/${GITHUB_REPOSITORY}/issues" \
+            -f state=open -f "labels=${MAINTENANCE_LABEL}" -F per_page=1 --jq '.[0].number // empty')"
+
+          if [ "${HALTED}" = "true" ]; then
+            body="The trailing-24h run volume crossed the abuse threshold. The README has been flipped to PAUSED and move processing is halted for this sweep. See ${RUN_URL} and game/RUNBOOK.md section 7."
+          else
+            body="The DOOM move loop has failed on consecutive runs. Moves are still safe: unprocessed moves stay open as issues and the next green run drains them. See ${RUN_URL} and game/RUNBOOK.md section 1."
+          fi
+
+          if [ -n "$existing" ]; then
+            jq -n --arg body "$body" '{body: $body}' \
+              | gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/issues/${existing}/comments" --input -
+          else
+            jq -n --arg body "$body" --arg label "${MAINTENANCE_LABEL}" --arg who "${GITHUB_REPOSITORY_OWNER}" \
+              '{title: "DOOM pipeline needs attention", body: $body, labels: [$label], assignees: [$who]}' \
+              | gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/issues" --input -
+          fi
+
+      - name: Halt and show PAUSED
+        if: steps.guard.outputs.halt == 'true'
+        run: |
+          set -euo pipefail
+          controls=()
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          python3 game/scripts/rewrite_readme.py --readme README.md --mapping "${MAPPING}" \
+            --state PAUSED "${controls[@]}" \
+            --image-url "${SCREEN_PAUSED}"
+          git add -- README.md
+          git commit -q -m "chore(doom): pause the game (run ${GITHUB_RUN_ID})" || exit 0
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      # --- drain: always re-read every pending move from the API -------------
+
+      - name: Collect open move issues
+        if: steps.guard.outputs.halt != 'true'
+        run: |
+          set -euo pipefail
+          # The drain invariant: the event payload is never the input. Only the
+          # four fields drain.py consumes are projected, and they land in a JSON
+          # file - visitor text never becomes a shell word.
+          gh api --paginate -X GET "repos/${GITHUB_REPOSITORY}/issues" \
+            -f state=open -f sort=created -f direction=asc -F per_page=100 \
+            --jq '.[] | select(has("pull_request") | not)
+                      | {number, title, created_at, user: {login: .user.login}}' \
+            | jq -s '.' > "${RUNNER_TEMP}/issues.json"
+          echo "open doom-eligible candidates: $(jq '[.[] | select(.title | startswith("doom: "))] | length' "${RUNNER_TEMP}/issues.json")"
+
+      - name: Inject the simulated title (dry run only)
+        if: steps.guard.outputs.halt != 'true' && env.DRY_RUN == 'true' && inputs.simulate_title != ''
+        env:
+          # Dispatch inputs are operator-supplied, so they get the same
+          # treatment as visitor text: env transport into jq --arg, never a
+          # shell word, never a run-block interpolation.
+          SIMULATE_TITLE: ${{ inputs.simulate_title }}
+        run: |
+          set -euo pipefail
+          jq --arg title "${SIMULATE_TITLE}" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '. + [{number: 999999999, title: $title, created_at: $now, user: {login: "simulated"}}]' \
+            "${RUNNER_TEMP}/issues.json" > "${RUNNER_TEMP}/issues.next.json"
+          mv "${RUNNER_TEMP}/issues.next.json" "${RUNNER_TEMP}/issues.json"
+
+      - name: Drain pending moves
+        if: steps.guard.outputs.halt != 'true'
+        run: |
+          set -euo pipefail
+          # Seven-step exactly-once drain (D14): ascending issue number, skip
+          # anything already in the ledger, per-run cap, TOCTOU re-validation
+          # through the parser, new-game cooldown and section cap, ledger lines
+          # out, and a post_push plan whose GitHub side effects this workflow
+          # executes strictly after the pushes.
+          python3 game/scripts/drain.py \
+            --issues "${RUNNER_TEMP}/issues.json" \
+            --ledger "${LEDGER}" \
+            --mapping "${MAPPING}" \
+            --out-moves "${RUNNER_TEMP}/moves.txt" \
+            --out-actions "${RUNNER_TEMP}/actions.json"
+
+      - name: Decide whether there is work
+        id: work
+        if: steps.guard.outputs.halt != 'true'
+        run: |
+          set -euo pipefail
+          # must_have 7: with no pending input the sweep stops here, before the
+          # toolchain restore and long before the engine. Two API reads and a
+          # sparse checkout is the whole cost of an idle sweep.
+          moves=false
+          if [ -s "${RUNNER_TEMP}/moves.txt" ]; then moves=true; fi
+          closes="$(jq -r '.post_push | length > 0' "${RUNNER_TEMP}/actions.json")"
+          {
+            echo "moves=${moves}"
+            echo "closes=${closes}"
+          } >> "$GITHUB_OUTPUT"
+          echo "moves=${moves} closes=${closes}"
+
+      # --- render: toolchain, apply, simulate, encode ------------------------
+
+      - name: Restore the pinned toolchain
+        id: toolchain
+        if: steps.work.outputs.moves == 'true'
+        uses: ./.github/actions/doom-toolchain
+
+      - name: Apply moves to the ledger and regenerate the stream
+        if: steps.work.outputs.moves == 'true'
+        env:
+          ENGINE_BUILD_SHA256: ${{ steps.toolchain.outputs.engine-build-sha256 }}
+        run: |
+          set -euo pipefail
+          # Appends the drained ledger lines, rolls the section over on a
+          # `new game` directive, regenerates stream.txt as expand(ledger) for
+          # the current section, and refuses to run when the current section
+          # header's engine/build/WAD/mapping pins disagree with the running
+          # toolchain (RFC determinism guarantees - a mismatch must never
+          # silently fork the timeline).
+          python3 game/scripts/apply_moves.py \
+            --ledger "${LEDGER}" \
+            --moves "${RUNNER_TEMP}/moves.txt" \
+            --mapping "${MAPPING}" \
+            --toolchain "${TOOLCHAIN}" \
+            --engine-build-sha256 "${ENGINE_BUILD_SHA256}" \
+            --stream "${STREAM}"
+
+      - name: Simulate the current section
+        id: simulate
+        if: steps.work.outputs.moves == 'true'
+        env:
+          ENGINE_BIN: ${{ steps.toolchain.outputs.engine-bin }}
+        run: |
+          set -euo pipefail
+          fps="$(jq -r '.engine_fps' "${MAPPING}")"
+          max_tail="$(jq -r '[.budget.ladder[].tail_seconds] | max' "${MAPPING}")"
+          resolution="$(jq -r '.engine.resolution' "${TOOLCHAIN}")"
+          width="${resolution%x*}"
+          height="${resolution#*x}"
+          wad="$(jq -r '.wad.file' "${TOOLCHAIN}")"
+
+          # SPEC section 1: menu navigation from boot into gameplay is a fixed
+          # engine-invocation constant owned by the toolchain, NOT part of the
+          # public grammar - no token expands to the menu keys e/x. Fail loudly
+          # rather than silently rendering the title screen for every player.
+          bootstrap="$(jq -r '.engine.bootstrap_stream // empty' "${TOOLCHAIN}")"
+          if [ -z "$bootstrap" ]; then
+            echo "::error::${TOOLCHAIN} .engine.bootstrap_stream is missing - without the recorded boot-to-gameplay prefix the replay renders the menu, silently. See the E5 report."
+            exit 1
+          fi
+
+          input="${RUNNER_TEMP}/sim.stream"
+          printf '%s,' "$bootstrap" > "$input"
+          cat "${STREAM}" >> "$input"
+
+          shim="${RUNNER_TEMP}/shim"
+          mkdir -p "$shim"
+          install -m 0755 .github/toolchain/ffmpeg-shim.py "${shim}/ffmpeg"
+
+          # doomreplay pipes to a subprocess it looks up as `ffmpeg` on PATH;
+          # the shim captures the raw framebuffer instead. The real encoder is
+          # always called by absolute path, so it can never be shadowed.
+          PATH="${shim}:${PATH}" "${ENGINE_BIN}" \
+            -iwad "$wad" \
+            -input "$input" \
+            -nrecord "$(( max_tail * fps ))" \
+            -output "${RUNNER_TEMP}/capture.raw" < /dev/null
+
+          test -s "${RUNNER_TEMP}/capture.raw" || { echo "::error::the replay produced no frames"; exit 1; }
+          {
+            echo "fps=${fps}"
+            echo "width=${width}"
+            echo "height=${height}"
+            echo "frame-bytes=$(( width * height * 4 ))"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Encode the GIF through the budget ladder
+        id: encode
+        if: steps.work.outputs.moves == 'true'
+        env:
+          FFMPEG_BIN: ${{ steps.toolchain.outputs.ffmpeg-bin }}
+          FPS: ${{ steps.simulate.outputs.fps }}
+          WIDTH: ${{ steps.simulate.outputs.width }}
+          HEIGHT: ${{ steps.simulate.outputs.height }}
+          FRAME_BYTES: ${{ steps.simulate.outputs.frame-bytes }}
+        run: |
+          set -euo pipefail
+          gif="${RUNNER_TEMP}/doom.gif"
+          published=false
+
+          for rung in $(jq -r '.budget.ladder[].level' "${MAPPING}"); do
+            tail_seconds="$(jq -r --arg r "$rung" '.budget.ladder[] | select(.level == $r) | .tail_seconds' "${MAPPING}")"
+            graph="$(jq -r --arg k "filtergraph_$(printf '%s' "$rung" | tr '[:upper:]' '[:lower:]')" '.encode[$k]' "${TOOLCHAIN}")"
+            slice=$(( tail_seconds * FPS * FRAME_BYTES ))
+
+            # THE encode gotcha: the engine emits BGRA with the alpha byte
+            # zeroed. Declaring the rawvideo input as `bgra` makes GIF treat
+            # every pixel as fully transparent and silently produces a few KB
+            # of nothing - no error, no warning. It MUST be `bgr0`.
+            # game/toolchain.json encode.pix_fmt_warning; gotchas/doomreplay.md
+            tail -c "$slice" "${RUNNER_TEMP}/capture.raw" \
+              | "${FFMPEG_BIN}" -hide_banner -nostdin -loglevel error -y \
+                  -f rawvideo -framerate "${FPS}" -s "${WIDTH}x${HEIGHT}" -pix_fmt bgr0 -i - \
+                  -filter_complex "$graph" -loop 0 -f gif "$gif"
+
+            rc=0
+            python3 game/scripts/budget.py --mapping "${MAPPING}" --rung "$rung" --file "$gif" || rc=$?
+            case "$rc" in
+              0)  published=true; echo "rung=${rung}" >> "$GITHUB_OUTPUT"; break ;;
+              10) echo "::notice::${rung} exceeds the ceiling - re-encoding at the next rung" ;;
+              11) echo "::error::the GIF exceeds the 4,000,000-byte ceiling at the last ladder rung - nothing is published"; exit 1 ;;
+              *)  echo "::error::budget.py failed with exit ${rc}"; exit 1 ;;
+            esac
+          done
+
+          [ "$published" = true ] || { echo "::error::the budget ladder ended without a publishable GIF"; exit 1; }
+          echo "size=$(stat -c%s "$gif") bytes" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rewrite the README game block to LIVE
+        id: rewrite
+        if: steps.work.outputs.moves == 'true'
+        run: |
+          set -euo pipefail
+          controls=()
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          # Validates the marker pair before touching a byte and writes only
+          # between the markers, atomically and idempotently (must_have 8).
+          # Exit 6 = marker validation failed: the file is untouched and the
+          # UNAVAILABLE swap stays suppressed (write contract, row 3).
+          python3 game/scripts/rewrite_readme.py --readme README.md --mapping "${MAPPING}" \
+            --state LIVE "${controls[@]}" \
+            --image-url "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/output/doom.gif?run=${GITHUB_RUN_ID}"
+
+      # --- publish: GIF first, then game state, then the post_push plan ------
+
+      - name: Push the GIF to the output branch
+        id: push_gif
+        if: steps.work.outputs.moves == 'true' && env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          # D10: GIF blobs live only on this force-pushed orphan branch, so
+          # `main` keeps growing nothing but tiny text commits - permanently.
+          # git plumbing builds the single-file parentless commit directly; no
+          # branch switch, no second worktree, no index churn.
+          blob="$(git hash-object -w -- "${RUNNER_TEMP}/doom.gif")"
+          tree="$(printf '100644 blob %s\tdoom.gif\n' "$blob" | git mktree)"
+          commit="$(git commit-tree "$tree" -m "chore(doom): publish frame for run ${GITHUB_RUN_ID}")"
+          # Pushed BEFORE the README repoint, so the fresh ?run= cache key can
+          # never resolve to a stale frame.
+          git push --force origin "${commit}:refs/heads/output"
+
+      - name: Push the game state
+        id: push_state
+        if: steps.work.outputs.moves == 'true' && env.DRY_RUN != 'true'
+        env:
+          ENGINE_BUILD_SHA256: ${{ steps.toolchain.outputs.engine-build-sha256 }}
+        run: |
+          set -euo pipefail
+          controls=()
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          attempts="$(jq -r '.knobs.push_retry_attempts' "${MAPPING}")"
+          moves="$(wc -l < "${RUNNER_TEMP}/moves.txt" | tr -d ' ')"
+          pushed=false
+
+          for attempt in $(seq 1 "$attempts"); do
+            # Explicit file pathspecs only - never `git add .` or `-A`, so no
+            # __pycache__, no capture.raw, nothing but game state can ever ride
+            # along in a game-state commit.
+            git add -- "${LEDGER}" "${STREAM}" README.md
+            if git diff --cached --quiet; then
+              # Moves were drained but nothing changed on disk. Committing
+              # nothing and pushing successfully would close issues that are
+              # NOT in the ledger - the exact lost-move failure D14 exists to
+              # prevent. Fail instead: the issues stay open and the next run
+              # re-drains them.
+              echo "::error::${moves} move(s) drained but the working tree is unchanged - refusing to close issues that never reached the ledger"
+              exit 1
+            fi
+            git commit -q -m "chore(doom): apply ${moves} move(s) (run ${GITHUB_RUN_ID})"
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then pushed=true; break; fi
+
+            echo "::notice::push rejected on attempt ${attempt} - regenerating on the fresh origin tip"
+            # rebase is not an option on a shallow clone (no merge base in the
+            # shallow set, and binary artifacts do not rebase anyway): reset to
+            # the new tip and regenerate. The ledger idempotency key makes the
+            # re-append safe.
+            git fetch --depth 1 origin "+refs/heads/${GITHUB_REF_NAME}:refs/remotes/origin/${GITHUB_REF_NAME}"
+            git reset --hard "origin/${GITHUB_REF_NAME}"
+            python3 game/scripts/apply_moves.py \
+              --ledger "${LEDGER}" --moves "${RUNNER_TEMP}/moves.txt" \
+              --mapping "${MAPPING}" --toolchain "${TOOLCHAIN}" \
+              --engine-build-sha256 "${ENGINE_BUILD_SHA256}" --stream "${STREAM}"
+            python3 game/scripts/rewrite_readme.py --readme README.md --mapping "${MAPPING}" \
+              --state LIVE "${controls[@]}" \
+              --image-url "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/output/doom.gif?run=${GITHUB_RUN_ID}"
+          done
+
+          [ "$pushed" = true ] || { echo "::error::the game-state push failed after ${attempts} attempts"; exit 1; }
+
+      - name: Close issues and post receipts
+        id: post_push
+        if: steps.work.outputs.closes == 'true' && env.DRY_RUN != 'true' && (steps.push_state.outcome == 'success' || steps.work.outputs.moves != 'true')
+        run: |
+          set -euo pipefail
+          # Strictly after the pushes. "Consumed" means present in the
+          # committed ledger; "closed" is UX cleanup only, so a close that
+          # never happens is simply retried next run as close-only cleanup.
+          gif_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/output/doom.gif?run=${GITHUB_RUN_ID}"
+          reactions=true
+          comments=true
+          denials=0
+          close_failures=0
+
+          mapfile -t items < <(jq -c '.post_push[]' "${RUNNER_TEMP}/actions.json")
+          for item in "${items[@]}"; do
+            number="$(jq -r '.issue' <<< "$item")"
+            action="$(jq -r '.action' <<< "$item")"
+            message="$(jq -r '.message // empty' <<< "$item")"
+            api="repos/${GITHUB_REPOSITORY}/issues/${number}"
+
+            # Receipt degradation ladder (SPEC section 6): the first denial
+            # drops reactions for the rest of the run, the second drops
+            # comments too. Closes are always attempted.
+            if [ "$action" = "close-applied" ] && [ "$reactions" = true ]; then
+              if ! jq -n '{content: "rocket"}' | gh api --silent -X POST "${api}/reactions" --input -; then
+                denials=$(( denials + 1 )); reactions=false
+                echo "::warning::reaction denied - dropping reactions for the rest of this run"
+              fi
+            fi
+
+            if [ "$comments" = true ]; then
+              body=""
+              case "$action" in
+                close-applied)
+                  # Fixed template. The only interpolated values are generated
+                  # by this run; no visitor text is ever written back.
+                  body="Move applied — here is the game right now:"$'\n\n'"![DOOM](${gif_url})"$'\n\n'"Run: ${RUN_URL}" ;;
+                close-reject)
+                  body="${message}" ;;
+                close-duplicate)
+                  body="" ;;
+              esac
+              if [ -n "$body" ]; then
+                if ! jq -n --arg body "$body" '{body: $body}' | gh api --silent -X POST "${api}/comments" --input -; then
+                  denials=$(( denials + 1 ))
+                  if [ "$denials" -ge 2 ]; then
+                    comments=false
+                    echo "::warning::comment denied twice - dropping comments for the rest of this run"
+                  fi
+                fi
+              fi
+            fi
+
+            reason=completed
+            if [ "$action" != "close-applied" ]; then reason=not_planned; fi
+            if ! jq -n --arg reason "$reason" '{state: "closed", state_reason: $reason}' \
+                 | gh api --silent -X PATCH "${api}" --input -; then
+              close_failures=$(( close_failures + 1 ))
+              echo "::warning::close failed for issue #${number} - it is retried next run as close-only cleanup"
+            fi
+          done
+
+          [ "$close_failures" -eq 0 ] || { echo "::error::${close_failures} issue close(s) failed"; exit 1; }
+
+      # --- sweep tail and the failure-path write contract --------------------
+
+      - name: Show PAUSED after inactivity
+        if: >-
+          github.event_name == 'schedule'
+          && steps.guard.outputs.idle == 'true'
+          && steps.work.outputs.moves != 'true'
+        run: |
+          set -euo pipefail
+          controls=()
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          # Pushed well before the 60-day scheduled-workflow auto-disable, so
+          # the profile shows an honest idle state instead of a stale frame.
+          python3 game/scripts/rewrite_readme.py --readme README.md --mapping "${MAPPING}" \
+            --state PAUSED "${controls[@]}" \
+            --image-url "${SCREEN_PAUSED}"
+          git add -- README.md
+          git commit -q -m "chore(doom): idle - show the paused screen (run ${GITHUB_RUN_ID})" || exit 0
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Swap in the UNAVAILABLE state screen
+        # The failure-path write contract, implemented as a condition rather
+        # than a blanket always(). It fires ONLY for the two rows that call for
+        # a display-only swap:
+        #   - pre-push failure (apply / simulate / encode / budget), and
+        #   - game-state push failure after the bounded retries.
+        # It is suppressed for:
+        #   - marker-validation failure (rewrite step failed: the markers just
+        #     failed validation, so nothing may be written inside them),
+        #   - post-push failure (push_state succeeded: a good LIVE frame must
+        #     never be overwritten by a failed close or receipt),
+        #   - close-only runs with no moves (no game state changed, so the
+        #     displayed frame is still accurate),
+        #   - runner loss / cancelation, where no step runs at all.
+        if: >-
+          failure()
+          && steps.work.outputs.moves == 'true'
+          && steps.rewrite.outcome != 'failure'
+          && steps.push_state.outcome != 'success'
+          && env.DRY_RUN != 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          controls=()
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          # Display-only: reset to the origin tip first so the un-pushed ledger
+          # and stream cannot ride along. Game state is never written by a
+          # failed run.
+          git fetch --depth 1 origin "+refs/heads/${GITHUB_REF_NAME}:refs/remotes/origin/${GITHUB_REF_NAME}"
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+          # Best effort by contract: this rewrite runs its own marker
+          # validation, and its push may fail for the same root cause as the
+          # run itself. Both are tolerated.
+          python3 game/scripts/rewrite_readme.py --readme README.md --mapping "${MAPPING}" \
+            --state UNAVAILABLE "${controls[@]}" \
+            --image-url "${SCREEN_UNAVAILABLE}"
+          git add -- README.md
+          git commit -q -m "chore(doom): moves are not being processed (run ${GITHUB_RUN_ID})" || exit 0
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Summarize
+        if: always()
+        # Every expansion travels through env, never into the script body -
+        # the same rule that keeps visitor text out of `run:` applies to
+        # workflow-generated values, so the invariant is uniform and greppable:
+        # this file contains no `${{ ... }}` inside any run block.
+        env:
+          MOVES: ${{ steps.work.outputs.moves || 'n/a' }}
+          CLOSES: ${{ steps.work.outputs.closes || 'n/a' }}
+          RUNG: ${{ steps.encode.outputs.rung || 'n/a' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Run"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| trigger | ${GITHUB_EVENT_NAME} |"
+            echo "| dry run | ${DRY_RUN} |"
+            echo "| moves applied | ${MOVES} |"
+            echo "| post-push actions | ${CLOSES} |"
+            echo "| ladder rung | ${RUNG} |"
+          } >> "$GITHUB_STEP_SUMMARY"

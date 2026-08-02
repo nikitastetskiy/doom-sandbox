@@ -1,0 +1,236 @@
+# Test and lint CI for the DOOM game pipeline.
+#
+# Seven independently named checks, one job each, so a red check names the
+# thing that broke instead of reading as "tests failed":
+#
+#   1. unit-suite               - the whole pytest glob (the safety net: a new
+#                                 test file is covered the moment it lands)
+#   2. stream-invariant         - stream == expand(ledger, mapping_version), D13
+#   3. control-table            - every rendered control link parses against the
+#                                 whitelist parser (must_have 1)
+#   4. spec-mapping-consistency - game/SPEC.md <-> game/mapping/v1.json value
+#                                 drift guard; its own check so a failure says
+#                                 "spec drift", not "a test failed"
+#   5. golden-frame             - determinism observable (must_have 2), and the
+#                                 job that captures the canonical ubuntu-24.04
+#                                 engine build hash for plan D9
+#   6. actionlint               - workflow static analysis
+#   7. zizmor                   - workflow security analysis
+#
+# Checks 2-4 also run inside check 1. That duplication is deliberate: the glob
+# guarantees nothing is silently uncovered, the named jobs give the diagnosis.
+#
+# Read-only permissions throughout; no job here writes anything anywhere.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  # Read-only, and only what checkout needs: no job here writes anything
+  # anywhere, and no `secrets.` reference exists in this file.
+  contents: read
+
+# Supersede in-flight runs for the same ref: CI feedback should track the tip,
+# not a queue of stale commits.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Exact pins. Nothing floats: a linter that changes under us turns a green
+  # pipeline red for reasons that have nothing to do with the change.
+  PYTEST_VERSION: '9.1.1'
+  ZIZMOR_VERSION: '1.29.0'
+  ACTIONLINT_VERSION: '1.7.12'
+  ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+
+jobs:
+  unit-suite:
+    name: Unit suite
+    # Pinned label, never ubuntu-latest: the 26.04 image is in public preview
+    # and the alias will migrate underneath the determinism pins (D12).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout only; every job here is read-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up the pinned Python
+        # ubuntu-24.04's system interpreter is PEP 668 externally-managed, so a
+        # bare `pip install` there is a coin flip. setup-python provides a
+        # tool-cache interpreter that pip owns outright.
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: python3 -m pip install --disable-pip-version-check --quiet "pytest==${PYTEST_VERSION}"
+      - name: Run the full suite
+        # The golden-frame test loud-skips here (no engine binary in this job);
+        # the golden-frame job below is where it actually executes.
+        run: python3 -m pytest game/tests/ -q
+
+  stream-invariant:
+    name: Stream == expand(ledger)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout only; every job here is read-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up the pinned Python
+        # ubuntu-24.04's system interpreter is PEP 668 externally-managed, so a
+        # bare `pip install` there is a coin flip. setup-python provides a
+        # tool-cache interpreter that pip owns outright.
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: python3 -m pip install --disable-pip-version-check --quiet "pytest==${PYTEST_VERSION}"
+      - name: Assert the D13 consistency invariant
+        run: |
+          python3 -m pytest -q \
+            game/tests/test_serialization.py::test_stream_equals_expand_of_ledger_byte_exact
+
+  control-table:
+    name: Control-table self-consistency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout only; every job here is read-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up the pinned Python
+        # ubuntu-24.04's system interpreter is PEP 668 externally-managed, so a
+        # bare `pip install` there is a coin flip. setup-python provides a
+        # tool-cache interpreter that pip owns outright.
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: python3 -m pip install --disable-pip-version-check --quiet "pytest==${PYTEST_VERSION}"
+      - name: Assert every rendered control link parses
+        run: python3 -m pytest -q game/tests/test_self_consistency.py
+
+  spec-mapping-consistency:
+    name: SPEC <-> mapping consistency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout only; every job here is read-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up the pinned Python
+        # ubuntu-24.04's system interpreter is PEP 668 externally-managed, so a
+        # bare `pip install` there is a coin flip. setup-python provides a
+        # tool-cache interpreter that pip owns outright.
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: python3 -m pip install --disable-pip-version-check --quiet "pytest==${PYTEST_VERSION}"
+      - name: Assert SPEC.md and mapping/v1.json agree
+        # A failure here means the human-readable normative table and the
+        # machine-readable mapping have drifted apart. Per SPEC section 3 that
+        # is a build error - neither file silently wins.
+        run: python3 -m pytest -q game/tests/test_spec_mapping_consistency.py
+
+  golden-frame:
+    name: Golden-frame determinism
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout only; every job here is read-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up the pinned Python
+        # ubuntu-24.04's system interpreter is PEP 668 externally-managed, so a
+        # bare `pip install` there is a coin flip. setup-python provides a
+        # tool-cache interpreter that pip owns outright.
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: python3 -m pip install --disable-pip-version-check --quiet "pytest==${PYTEST_VERSION}"
+      - name: Restore the pinned toolchain
+        id: toolchain
+        # Same exact-key, verify-or-rebuild path doom.yml uses - so the hash
+        # this job reports is the hash the game will actually run on. ffmpeg is
+        # not needed: the test captures raw frames through its own shim.
+        uses: ./.github/actions/doom-toolchain
+        with:
+          need-ffmpeg: 'false'
+      - name: Replay the fixture and compare checksums
+        env:
+          DOOM_ENGINE_BIN: ${{ steps.toolchain.outputs.engine-bin }}
+        # Identical framebuffer checksum at the final frame plus identical
+        # frame count across independent runs on the pinned image: the
+        # measurable meaning of "same game" (must_have 2). This job's summary
+        # carries the built engine SHA-256 that plan D9 captures.
+        run: python3 -m pytest -q game/tests/test_golden_frame.py
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # checkout only; every job here is read-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          tarball="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 --output "$tarball" -- \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum --check --status
+          tar -xzf "$tarball" -C "${RUNNER_TEMP}" actionlint
+      - name: Lint the workflows
+        run: |
+          "${RUNNER_TEMP}/actionlint" -color
+
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # checkout only; every job here is read-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up the pinned Python
+        # ubuntu-24.04's system interpreter is PEP 668 externally-managed, so a
+        # bare `pip install` there is a coin flip. setup-python provides a
+        # tool-cache interpreter that pip owns outright.
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install zizmor
+        # zizmor ships as a Rust binary in a wheel: it installs a console
+        # script and has no importable module, so `python -m zizmor` does not
+        # work. Invoke the script.
+        run: python3 -m pip install --disable-pip-version-check --quiet "zizmor==${ZIZMOR_VERSION}"
+      - name: Audit the workflows and the composite action
+        # Offline: no GitHub API calls, so no token is needed and no `secrets.`
+        # reference exists anywhere in this repository's CI.
+        run: |
+          zizmor --no-online-audits --persona=regular .github/workflows .github/actions
