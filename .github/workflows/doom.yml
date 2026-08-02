@@ -721,21 +721,27 @@ jobs:
         # The failure-path write contract, implemented as a condition rather
         # than a blanket always(). It fires ONLY for the two rows that call for
         # a display-only swap:
-        #   - pre-push failure (apply / simulate / encode / budget), and
+        #   - pre-push failure (drain / apply / simulate / encode / budget), and
         #   - game-state push failure after the bounded retries.
         # It is suppressed for:
-        #   - marker-validation failure (rewrite step failed: the markers just
-        #     failed validation, so nothing may be written inside them),
-        #   - post-push failure (push_state succeeded: a good LIVE frame must
-        #     never be overwritten by a failed close or receipt),
-        #   - close-only runs with no moves (no game state changed, so the
-        #     displayed frame is still accurate),
+        #   - marker-validation failure (rewrite failed: the markers just failed
+        #     validation, so nothing may be written inside them),
+        #   - post-push failure with a landed push (push_state succeeded: a good
+        #     LIVE frame is never overwritten by a failed close or receipt),
+        #   - post-push failure on a close-only run (no game state was eligible
+        #     to change, so the displayed frame is still accurate),
         #   - runner loss / cancelation, where no step runs at all.
+        #
+        # Suppression keys off WHICH step failed, not off whether there were
+        # moves. Gating on moves was wrong in one direction: a drain failure
+        # leaves `work` skipped, so the swap never fired even though a failed
+        # drain is squarely the pre-push row. That path is reachable now that
+        # drain.py takes --toolchain and can exit 2/5 on it.
         if: >-
           failure()
-          && steps.work.outputs.moves == 'true'
           && steps.rewrite.outcome != 'failure'
           && steps.push_state.outcome != 'success'
+          && steps.post_push.outcome != 'failure'
           && env.DRY_RUN != 'true'
         continue-on-error: true
         run: |
