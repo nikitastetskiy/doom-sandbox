@@ -67,9 +67,34 @@ Read the failing step name — it maps directly onto a write-contract row:
 | Failing step | Class | What was written |
 |---|---|---|
 | Drain / Apply / Simulate / Encode | pre-push | nothing; best-effort UNAVAILABLE swap |
+| Apply moves — *determinism pin mismatch* | refuse-to-run | nothing → see the note below |
 | Rewrite the README game block | marker validation | nothing at all, swap suppressed → [section 6](#6-marker-repair-the-fail-safe-brick) |
 | Push the game state | push failure | GIF may be on `output`; ledger is not on the default branch |
 | Close issues and post receipts | post-push | everything landed; only receipts failed → [section 7](#7-receipt-degradation-under-secondary-rate-limits) |
+
+**The one failure that a re-run will not fix: determinism pin mismatch.**
+`apply_moves.py` exits 7 when the current section header's `engine`/`build`/
+`wad`/`mapping` pins disagree with the toolchain the run is actually holding. It
+refuses rather than let a swapped engine silently fork the timeline. What is
+certain, and independent of how you resolve it:
+
+- **Nothing was written.** The ledger and the stream are byte-untouched; every
+  drained move is still an open issue. There is no partial state to repair.
+- **Retrying reproduces it exactly.** Dispatching again, or waiting for the
+  sweep, changes nothing — the pins still disagree. After two such runs the
+  sweep will open a `doom-maintenance` issue, which is working as intended.
+- **The fix is to make the two agree**, not to retry. The run summary prints a
+  four-row table naming which pin differs and both values:
+
+  ```sh
+  gh run view <run-id> --repo "$REPO"          # the summary carries the table
+  grep '^#section ' game/state/log.txt | tail -1   # the header the game is on
+  jq '{engine: .engine.commit_sha, wad: .wad.sha256, build: .engine.build_sha256}' game/toolchain.json
+  ```
+
+  A `build` row that differs while `engine` matches usually means the engine
+  build hash in `game/toolchain.json` is still the provisional local value and
+  the canonical ubuntu-24.04 hash has not been captured yet.
 
 **Recover.** Fix the cause if there is one, then run a normal dispatch
 ([section 2](#2-manual-dispatch-drain-re-render-and-unavailable-recovery)). If

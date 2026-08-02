@@ -368,6 +368,7 @@ jobs:
         uses: ./.github/actions/doom-toolchain
 
       - name: Apply moves to the ledger and regenerate the stream
+        id: apply
         if: steps.work.outputs.moves == 'true'
         env:
           ENGINE_BUILD_SHA256: ${{ steps.toolchain.outputs.engine-build-sha256 }}
@@ -379,13 +380,60 @@ jobs:
           # header's engine/build/WAD/mapping pins disagree with the running
           # toolchain (RFC determinism guarantees - a mismatch must never
           # silently fork the timeline).
+          # Exit taxonomy (pinned by game/tests/test_apply_moves.py):
+          #   0 ok / 2 usage / 5 corrupt content / 7 determinism pin mismatch.
+          # 7 is branched on deliberately - it is not an error in the pipeline,
+          # it is the guard doing its job, and it is permanent: every retry,
+          # sweep and new move fails identically until the running toolchain and
+          # the current section header agree. Every non-zero exit leaves the
+          # ledger and the stream byte-untouched (atomic writes, guaranteed by
+          # the contract), so this lands on the pre-push row of the write
+          # contract: no game state written, moves stay open, best-effort
+          # UNAVAILABLE swap.
+          rc=0
           python3 game/scripts/apply_moves.py \
             --ledger "${LEDGER}" \
             --moves "${RUNNER_TEMP}/moves.txt" \
             --mapping "${MAPPING}" \
             --toolchain "${TOOLCHAIN}" \
             --engine-build-sha256 "${ENGINE_BUILD_SHA256}" \
-            --stream "${STREAM}"
+            --stream "${STREAM}" || rc=$?
+
+          if [ "$rc" -eq 7 ]; then
+            echo "pin-mismatch=true" >> "$GITHUB_OUTPUT"
+            header="$(grep '^#section ' "${LEDGER}" | tail -1)"
+            {
+              echo "### Refused: determinism pin mismatch"
+              echo ""
+              echo "The current section header and the running toolchain disagree."
+              echo "Nothing was written: the ledger and stream are byte-untouched and"
+              echo "every drained move is still an open issue. Retrying reproduces this"
+              echo "exactly until the pins agree. See game/RUNBOOK.md section 1."
+              echo ""
+              echo "| pin | current section header | running toolchain |"
+              echo "| --- | --- | --- |"
+              for field in engine build wad mapping; do
+                observed="$(printf '%s\n' "$header" | tr ' ' '\n' | sed -n "s/^${field}=//p")"
+                case "$field" in
+                  engine)  running="$(jq -r '.engine.commit_sha' "${TOOLCHAIN}")" ;;
+                  build)   running="${ENGINE_BUILD_SHA256}" ;;
+                  wad)     running="$(jq -r '.wad.sha256' "${TOOLCHAIN}")" ;;
+                  mapping) running="$(jq -r '.mapping_version' "${MAPPING}")" ;;
+                  *)       running='' ;;
+                esac
+                mark=''
+                if [ "$observed" != "$running" ]; then mark=' **differs**'; fi
+                echo "| \`${field}\` | \`${observed}\` | \`${running}\`${mark} |"
+              done
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::determinism pin mismatch - refusing to run rather than silently forking the timeline. No game state was written; the drained moves remain open. See the run summary and game/RUNBOOK.md section 1."
+            exit 1
+          fi
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::apply_moves.py failed with exit ${rc} (2=usage, 5=corrupt input); the ledger and stream are byte-untouched"
+            exit 1
+          fi
 
       - name: Simulate the current section
         id: simulate
@@ -548,10 +596,24 @@ jobs:
             # re-append safe.
             git fetch --depth 1 origin "+refs/heads/${GITHUB_REF_NAME}:refs/remotes/origin/${GITHUB_REF_NAME}"
             git reset --hard "origin/${GITHUB_REF_NAME}"
+            # Re-applying the same batch on the fresh tip is safe by contract:
+            # a move whose issue number is already anywhere in the ledger is
+            # skipped, never duplicated (the D14 idempotency key).
+            rc=0
             python3 game/scripts/apply_moves.py \
               --ledger "${LEDGER}" --moves "${RUNNER_TEMP}/moves.txt" \
               --mapping "${MAPPING}" --toolchain "${TOOLCHAIN}" \
-              --engine-build-sha256 "${ENGINE_BUILD_SHA256}" --stream "${STREAM}"
+              --engine-build-sha256 "${ENGINE_BUILD_SHA256}" --stream "${STREAM}" || rc=$?
+            if [ "$rc" -eq 7 ]; then
+              # Reachable here only if a toolchain bump landed on the branch
+              # mid-run. Nothing was written; stop rather than retry.
+              echo "::error::determinism pin mismatch after resetting to the fresh origin tip - the toolchain changed underneath this run. No game state was written. See game/RUNBOOK.md section 1."
+              exit 1
+            fi
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::apply_moves.py failed with exit ${rc} while regenerating on the fresh tip"
+              exit 1
+            fi
             python3 game/scripts/rewrite_readme.py --readme README.md --mapping "${MAPPING}" \
               --state LIVE "${controls[@]}" \
               --image-url "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/output/doom.gif?run=${GITHUB_RUN_ID}"
@@ -694,6 +756,7 @@ jobs:
           MOVES: ${{ steps.work.outputs.moves || 'n/a' }}
           CLOSES: ${{ steps.work.outputs.closes || 'n/a' }}
           RUNG: ${{ steps.encode.outputs.rung || 'n/a' }}
+          PIN_MISMATCH: ${{ steps.apply.outputs.pin-mismatch || 'false' }}
         run: |
           set -euo pipefail
           {
@@ -706,4 +769,5 @@ jobs:
             echo "| moves applied | ${MOVES} |"
             echo "| post-push actions | ${CLOSES} |"
             echo "| ladder rung | ${RUNG} |"
+            echo "| determinism pin mismatch | ${PIN_MISMATCH} |"
           } >> "$GITHUB_STEP_SUMMARY"
