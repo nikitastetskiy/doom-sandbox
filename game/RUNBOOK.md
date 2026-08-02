@@ -30,6 +30,7 @@ Quick reference:
 | 6 | Every run aborts with a marker error | [6. Marker repair (the fail-safe brick)](#6-marker-repair-the-fail-safe-brick) |
 | 7 | Receipts stopped appearing | [7. Receipt degradation](#7-receipt-degradation-under-secondary-rate-limits) |
 | 8 | The README image is stale | [8. Camo PURGE (use sparingly)](#8-camo-purge-use-sparingly) |
+| 9 | Runs are green but moves are bounced with "the arcade is being upgraded" | [9. Sealed section (pin mismatch)](#9-sealed-section-pin-mismatch) |
 
 ---
 
@@ -67,34 +68,19 @@ Read the failing step name — it maps directly onto a write-contract row:
 | Failing step | Class | What was written |
 |---|---|---|
 | Drain / Apply / Simulate / Encode | pre-push | nothing; best-effort UNAVAILABLE swap |
-| Apply moves — *determinism pin mismatch* | refuse-to-run | nothing → see the note below |
+| Apply moves — exit 7 | refuse-to-run | nothing → [section 9](#9-sealed-section-pin-mismatch) |
 | Rewrite the README game block | marker validation | nothing at all, swap suppressed → [section 6](#6-marker-repair-the-fail-safe-brick) |
 | Push the game state | push failure | GIF may be on `output`; ledger is not on the default branch |
 | Close issues and post receipts | post-push | everything landed; only receipts failed → [section 7](#7-receipt-degradation-under-secondary-rate-limits) |
 
-**The one failure that a re-run will not fix: determinism pin mismatch.**
-`apply_moves.py` exits 7 when the current section header's `engine`/`build`/
-`wad`/`mapping` pins disagree with the toolchain the run is actually holding. It
-refuses rather than let a swapped engine silently fork the timeline. What is
-certain, and independent of how you resolve it:
-
-- **Nothing was written.** The ledger and the stream are byte-untouched; every
-  drained move is still an open issue. There is no partial state to repair.
-- **Retrying reproduces it exactly.** Dispatching again, or waiting for the
-  sweep, changes nothing — the pins still disagree. After two such runs the
-  sweep will open a `doom-maintenance` issue, which is working as intended.
-- **The fix is to make the two agree**, not to retry. The run summary prints a
-  four-row table naming which pin differs and both values:
-
-  ```sh
-  gh run view <run-id> --repo "$REPO"          # the summary carries the table
-  grep '^#section ' game/state/log.txt | tail -1   # the header the game is on
-  jq '{engine: .engine.commit_sha, wad: .wad.sha256, build: .engine.build_sha256}' game/toolchain.json
-  ```
-
-  A `build` row that differs while `engine` matches usually means the engine
-  build hash in `game/toolchain.json` is still the provisional local value and
-  the canonical ubuntu-24.04 hash has not been captured yet.
+**Exit 7 from *Apply moves* is not an ordinary failure.** It means a
+frame-contributing move was about to land in a **sealed** section — a section
+whose pins no longer match the running toolchain. Under SPEC §5.5 the drain is
+supposed to prevent that from ever reaching `apply_moves.py`, so seeing exit 7
+means the drain misbehaved: treat it as a pipeline bug, not an operational
+event. Nothing was written either way. Go to
+[section 9](#9-sealed-section-pin-mismatch), which covers both the normal
+(self-healing) pin-mismatch path and this anomaly.
 
 **Recover.** Fix the cause if there is one, then run a normal dispatch
 ([section 2](#2-manual-dispatch-drain-re-render-and-unavailable-recovery)). If
@@ -383,6 +369,85 @@ Prefer a re-render, which changes the URL and needs no purge at all:
 ```sh
 gh workflow run doom.yml --repo "$REPO" --ref main
 ```
+
+---
+
+## 9. Sealed section (pin mismatch)
+
+**Symptom.** Runs are **green**, but every move comes back closed with
+`the arcade is being upgraded — press New game to continue`, the README shows the
+SEALED screen, the ledger stops growing and no new GIF is published.
+
+**This is the guard working, not a fault.** A section is *sealed* when any pin in
+its header — `engine`, `build`, `wad`, `mapping` — no longer matches the running
+toolchain, which happens whenever the engine, the WAD, the mapping version or the
+recorded build hash is bumped. Rather than append moves to a section it can no
+longer reproduce, the game refuses to advance that section and says so. Sealing
+is computed at run time by comparison; it is never stored or configured, so there
+is no flag to unset.
+
+**It clears itself.** `doom: new game` contributes zero frames, so it provably
+cannot alter the sealed section's replay output — which makes it the one
+admissible move while sealed. The first reset submitted closes the sealed section
+and opens a fresh one carrying the running pins; play resumes immediately, and
+any later moves in the same batch land in the new section and simulate normally.
+The 30-minute new-game cooldown does **not** apply while sealed, so recovery can
+never be rate-limited away. **No operator action is required** — the normal
+outcome is that a player presses New game within an ordinary play window and the
+game heals in band.
+
+**Confirm that is what you are looking at** — the runs should be green, and
+exactly one pin should differ:
+
+```sh
+gh run list --repo "$REPO" --workflow doom.yml --limit 5      # green, not red
+grep '^#section ' game/state/log.txt | tail -1                # the header in force
+jq '{engine: .engine.commit_sha, wad: .wad.sha256,
+     build: .engine.build_sha256.value, build_status: .engine.build_sha256.status}' game/toolchain.json
+jq -r '.mapping_version' game/mapping/v1.json
+```
+
+A `build` that differs while `engine` matches usually means the recorded engine
+build hash is still the provisional local value and the canonical `ubuntu-24.04`
+hash has not been captured yet.
+
+**To clear it now** — because nobody is playing, or because you just bumped the
+toolchain and want the game live again — submit the reset yourself. It is an
+ordinary move, not a privileged operation:
+
+```sh
+gh issue create --repo "$REPO" \
+  --title 'doom: new game' \
+  --body 'Unsealing after a toolchain bump.'
+```
+
+The title must be byte-exact. Then confirm the rollover landed:
+
+```sh
+gh run watch "$(gh run list --repo "$REPO" --workflow doom.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --repo "$REPO"
+git pull --ff-only
+grep -c '^#section ' game/state/log.txt      # one more section than before
+grep '^#section ' game/state/log.txt | tail -1   # pins now match the toolchain
+```
+
+**When to escalate.** Each of these means a code defect, not an incident:
+
+| Observation | Meaning |
+|---|---|
+| A `doom: new game` was submitted but the section did not roll over | the drain is not applying the sealed-mode exemption |
+| *Apply moves* fails with **exit 7** | a frame-contributing move reached `apply_moves.py` while sealed; the drain should have rejected it first. Defense in depth caught it and wrote nothing — but the drain is wrong |
+| Sealed with no toolchain change | check recent commits to `game/toolchain.json` and `game/mapping/v1.json` |
+| Sealed before anyone has ever played | expected while the build hash is provisional; the first reset clears it |
+
+For the first two, stop the game
+([section 3](#3-emergency-stop-gh-workflow-disable)) and treat it as a bug.
+
+**What not to do.** Do not hand-edit `game/state/log.txt`, and do not rewrite a
+section header to make the pins agree. The rollover is the only runtime recovery
+and it is designed to need no privileged intervention; editing authoritative
+committed state to step around a guard is precisely how a timeline forks. If the
+pins themselves are wrong, fix `game/toolchain.json` (or revert the bump) and let
+a reset roll the section over.
 
 ---
 
