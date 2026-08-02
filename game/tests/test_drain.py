@@ -26,9 +26,24 @@
       token id, count, #number), ascending, one per line, trailing LF; zero
       moves -> zero-byte file. out-actions: JSON {"mapping_version": 1, "moves":
       [{"issue","token","count"}...], "post_push": [{"issue","action":
-      close-applied|close-duplicate|close-reject, "message": str|null}...]} —
-      ALL closes live under post_push (executed strictly after successful
-      pushes, RFC D14 step 7); byte-deterministic for identical inputs
+      close-applied|close-duplicate|close-reject, "message": str|null,
+      "reason": <code>}...]} — ALL closes live under post_push (executed
+      strictly after successful pushes, RFC D14 step 7); byte-deterministic for
+      identical inputs
+    - AMENDMENT (Kou is changing drain.py's emitted plan, not only adding a new
+      script): every post_push entry gains a machine-readable "reason" code so
+      .github/workflows/doom.yml can branch WITHOUT re-deriving any normative
+      constant in YAML. Exactly one of:
+        applied     -> close-applied
+        duplicate   -> close-duplicate (already in the committed ledger)
+        grammar     -> close-reject from the parser's whitelist
+        cooldown    -> close-reject, `new game` inside the D16 cooldown
+        section-cap -> close-reject, active section at the SPEC §6 frame cap
+      "section-cap" is load-bearing: it is the trigger the workflow needs to
+      swap in the LOG_FULL state screen (game/assets/screens/log-full.png,
+      currently committed with no consumer). The human-facing "message" string
+      stays exactly as it is — reason is additive, never a replacement, and the
+      two must agree
 @edge-cases
     - Per-issue malformed records (missing keys / bad created_at): skipped with
       no action; header insertion after an accepted new-game is the appender's
@@ -57,6 +72,26 @@ from conftest import (
 
 TS = "2026-07-30T14:02:11Z"
 EMPTY_LEDGER = make_section_text([], n=1)
+
+# Machine-readable reason codes on the post_push plan (see the @spec-handoff
+# amendment). The workflow branches on these; it must never re-derive a
+# normative constant in YAML.
+REASON_APPLIED = "applied"
+REASON_DUPLICATE = "duplicate"
+REASON_GRAMMAR = "grammar"
+REASON_COOLDOWN = "cooldown"
+REASON_SECTION_CAP = "section-cap"
+REASON_CODES = {
+    REASON_APPLIED, REASON_DUPLICATE, REASON_GRAMMAR,
+    REASON_COOLDOWN, REASON_SECTION_CAP,
+}
+ACTION_FOR_REASON = {
+    REASON_APPLIED: "close-applied",
+    REASON_DUPLICATE: "close-duplicate",
+    REASON_GRAMMAR: "close-reject",
+    REASON_COOLDOWN: "close-reject",
+    REASON_SECTION_CAP: "close-reject",
+}
 
 
 def post_push_by_issue(actions):
@@ -401,8 +436,9 @@ def test_all_close_actions_live_under_the_post_push_phase(tmp_path):
     assert set(actions) == {"mapping_version", "moves", "post_push"}
     assert actions["mapping_version"] == 1
     for entry in actions["post_push"]:
-        assert set(entry) == {"issue", "action", "message"}
+        assert set(entry) == {"issue", "action", "message", "reason"}
         assert entry["action"] in {"close-applied", "close-duplicate", "close-reject"}
+        assert entry["reason"] in REASON_CODES
     issues_in_post_push = [e["issue"] for e in actions["post_push"]]
     assert issues_in_post_push == sorted(issues_in_post_push)
     assert set(issues_in_post_push) == {89, 90, 91}
@@ -463,6 +499,75 @@ def test_corrupt_ledger_is_exit_5_refuse_rather_than_guess(tmp_path):
         "this is not a valid game log\n",
     )
     assert proc.returncode == 5
+
+
+# --- Machine-readable reason codes (workflow LOG_FULL wiring) -------------------
+
+def test_section_cap_reject_carries_the_section_cap_reason_code(tmp_path):
+    """The trigger .github/workflows/doom.yml needs to swap in the LOG_FULL
+    state screen without re-deriving the SPEC section cap in YAML."""
+    issues = [make_issue(9001, "doom: forward", TS, login="late-player")]
+    proc, _, actions_path = run_drain(tmp_path, issues, at_cap_ledger())
+    assert proc.returncode == 0
+    entry = post_push_by_issue(load_actions(actions_path))[9001]
+    assert entry["reason"] == REASON_SECTION_CAP
+    assert entry["action"] == "close-reject"
+    assert entry["message"] == LOG_FULL_MESSAGE, "message stays; reason is additive"
+
+
+def test_section_cap_reason_is_distinguishable_from_a_grammar_reject(tmp_path):
+    """Both are close-reject, so `action` alone cannot drive the state screen —
+    this is precisely why the reason code exists."""
+    issues = [
+        make_issue(9001, "doom: forward", TS, login="capped"),
+        make_issue(9002, "doom: nonsense", TS, login="typo"),
+    ]
+    proc, _, actions_path = run_drain(tmp_path, issues, at_cap_ledger())
+    assert proc.returncode == 0
+    by_issue = post_push_by_issue(load_actions(actions_path))
+    assert by_issue[9001]["action"] == by_issue[9002]["action"] == "close-reject"
+    assert by_issue[9001]["reason"] == REASON_SECTION_CAP
+    assert by_issue[9002]["reason"] == REASON_GRAMMAR
+
+
+def test_cooldown_reject_carries_the_cooldown_reason_code(tmp_path):
+    issues = [make_issue(30, "doom: new game", "2026-07-30T15:29:59Z", login="griefer")]
+    proc, _, actions_path = run_drain(tmp_path, issues, COOLDOWN_LEDGER)
+    assert proc.returncode == 0
+    entry = post_push_by_issue(load_actions(actions_path))[30]
+    assert entry["reason"] == REASON_COOLDOWN
+    assert entry["action"] == "close-reject"
+
+
+def test_applied_and_duplicate_carry_their_reason_codes(tmp_path):
+    ledger = make_section_text([ledger_line(TS, "old", "fire", 1, 100)], n=1)
+    issues = [
+        make_issue(100, "doom: fire", TS, login="old"),
+        make_issue(101, "doom: back", TS, login="new"),
+    ]
+    proc, _, actions_path = run_drain(tmp_path, issues, ledger)
+    assert proc.returncode == 0
+    by_issue = post_push_by_issue(load_actions(actions_path))
+    assert by_issue[100]["reason"] == REASON_DUPLICATE
+    assert by_issue[101]["reason"] == REASON_APPLIED
+
+
+def test_every_reason_code_agrees_with_its_action(tmp_path):
+    """reason and action must never disagree — the workflow trusts both."""
+    ledger = make_section_text([ledger_line(TS, "old", "fire", 1, 100)], n=1)
+    issues = [
+        make_issue(100, "doom: fire", TS, login="old"),
+        make_issue(101, "doom: back", TS, login="ok"),
+        make_issue(102, "doom: jump", TS, login="typo"),
+    ]
+    proc, _, actions_path = run_drain(tmp_path, issues, ledger)
+    assert proc.returncode == 0
+    for entry in load_actions(actions_path)["post_push"]:
+        assert entry["reason"] in REASON_CODES
+        assert entry["action"] == ACTION_FOR_REASON[entry["reason"]], (
+            f"issue {entry['issue']}: reason {entry['reason']!r} disagrees with "
+            f"action {entry['action']!r}"
+        )
 
 
 def test_zero_eligible_issues_yield_empty_outputs(tmp_path):
