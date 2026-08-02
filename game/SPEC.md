@@ -184,10 +184,27 @@ Degraded-mode note (§5.5, §6 cap): a run whose drained moves are **all** rejec
 ## 12. GIF budget constants (RFC D7)
 
 - **Hard byte ceiling: 4.0 MB = 4,000,000 bytes** (single exact constant; under the 5 MB Camo reference cap with headroom).
+- **Hard byte floor: 16,000 bytes** (mapping `budget.floor_bytes`). An artifact at or below the floor is treated as a **broken encode, never as a small one**.
 - Re-encode ladder (checked-in budget script; hard-fail, no publish, if L2 still exceeds the ceiling):
   - **L0**: 15 s tail @ 320 px wide / 12 fps / 128 colors (bayer dithered)
   - **L1**: 12 s tail @ 320 px / 12 fps / 128 colors
   - **L2**: 12 s tail @ 256 px / 10 fps / 64 colors
+### 12.1 Publication requires positive structural evidence (normative)
+
+The publish gate must **affirmatively establish that the artifact is a well-formed, non-degenerate GIF**. The absence of a ceiling violation is not evidence of anything: a 0-byte file, a truncated file, and a palette-collapsed file all satisfy "not too large". This plan has now produced four failure instances in which exit status and byte count both reported success while the artifact was wrong (`bgr0` palette collapse, the title-screen preamble, the 0-byte GIF, and the gate that was meant to catch them) — **treat a clean exit code as the weakest available evidence.**
+
+Gate order, all three required before publication:
+
+1. **Structural validity** — the file exists, is non-empty, and begins with the `GIF89a` magic bytes. May be enforced in the workflow or in the script, but must precede the size verdict.
+2. **Floor** — `size > floor_bytes` (§12).
+3. **Ceiling / ladder** — `size <= ceiling_bytes`, otherwise descend the ladder (§12).
+
+**Floor violation behavior**: `size <= floor_bytes` is a **hard failure — exit code 12, no publish, and no ladder descent**, regardless of the current rung. The ladder exists to make oversized output smaller; descending a rung on an undersized artifact makes it *smaller still*, which cannot repair it and merely burns encodes. A sub-floor artifact is evidence that the encode is broken (collapse, truncation, zero-length), not that it is mis-tuned. The run then takes the **pre-push failure** path of the write contract (§10): game state untouched, best-effort UNAVAILABLE swap, issues left open, next run retries.
+
+Emitted JSON on a hard failure carries `"hard_fail": true`, `"next": null`, and a `"reason"` of `"floor"` or `"ceiling"` so the workflow can branch and the operator can diagnose without reading logs. The floor is reported alongside the ceiling in the gate's output.
+
+**Choosing 16,000 bytes.** Measured reference points: a legitimate single-frame still ≈ **46 KB**; a legitimate 18-frame clip ≈ **276 KB**; the recorded palette-collapse signature ≈ **a few KB** (GIF inter-frame differencing keeps a collapsed clip tiny no matter how many frames it holds, which is exactly why length is not a usable discriminator). 16,000 bytes sits near the geometric centre of that band — roughly 2x above the collapse signature and ~2.9x below the smallest legitimate artifact. Both error directions are loud rather than silent, but they are not symmetric: a false positive refuses one publish, turns the block UNAVAILABLE, alerts via the sweep, and self-heals on the next move; a false negative ships a blank frame to a visitor with everything upstream reporting success. The floor is therefore biased toward catching collapses. Re-verify if the ladder rungs or `pix_fmt` change.
+
 - Ladder constants adjusted in E2 (2026-07-30) per the RFC's plan-time re-verify (Sho S2): worst-case
   active-play encode rate measured at ~248–267 KB/s with the pinned static ffmpeg (n8.1.2) — not the
   provisional ~150 KB/s — so a 20 s L0 tail measured **5.33 MB > 4.0 MB ceiling** and would never publish.

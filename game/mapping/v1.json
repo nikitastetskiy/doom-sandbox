@@ -104,6 +104,7 @@
   },
   "budget": {
     "ceiling_bytes": 4000000,
+    "floor_bytes": 16000,
     "ladder": [
       { "level": "L0", "tail_seconds": 15, "width_px": 320, "fps": 12, "colors": 128 },
       { "level": "L1", "tail_seconds": 12, "width_px": 320, "fps": 12, "colors": 128 },
