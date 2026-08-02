@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""Exactly-once move drain (RFC D14/D16, SPEC sections 4 and 6).
+
+Files in, files out.  The open-issue list is a JSON file (a GitHub REST subset)
+and the result is two files: canonical ledger lines to append, and a JSON
+action plan.  There is no network call and no wall-clock read anywhere in this
+script -- every ``gh``/API interaction stays in the workflow, driven by the
+emitted action plan, so the whole drain is unit-testable offline and
+byte-deterministic for identical inputs.
+
+The seven steps (RFC D14):
+  1. consider only ``doom: ``-prefixed issues, ascending by issue number;
+  2. issue numbers already in the committed ledger are close-only duplicates
+     and never re-appended (they do not consume the per-run cap);
+  3. take up to the mapping's per-run drain cap;
+  4. re-validate every taken title through ``parse_title.py`` at consume time
+     (TOCTOU: the title may have been edited since the triggering event) --
+     the title travels as a JSON file, never as argv and never through a shell;
+  5. apply the ``new game`` cooldown and the section frame cap;
+  6. emit the accepted ledger lines for the appender to push;
+  7. emit every close under ``post_push`` -- closes run strictly after the
+     pushes succeed.
+
+Visitor text never leaves this script: only canonical token ids, bounded
+counts, sanitized handles, issue numbers, and fixed reject messages are
+written.
+
+Usage: drain.py --issues FILE --ledger FILE [--mapping PATH]
+                --out-moves PATH --out-actions PATH
+Exit codes: 0 ok / 2 usage / 5 corrupt input content
+
+@see game/SPEC.md sections 4 and 6; RFC D14/D16; game/scripts/parse_title.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import gamelog
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_CORRUPT = 5
+
+PARSER_PATH = Path(__file__).resolve().parent / "parse_title.py"
+
+TITLE_PREFIX = "doom: "
+HANDLE_FALLBACK = "player"
+HANDLE_MAX = 39  # SPEC 5.3 handle grammar
+_HANDLE_STRIP_RE = re.compile(r"[^A-Za-z0-9-]")
+_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+ACTION_APPLIED = "close-applied"
+ACTION_DUPLICATE = "close-duplicate"
+ACTION_REJECT = "close-reject"
+
+#: SPEC section 6, verbatim: the section-cap guidance string is normative.
+LOG_FULL_MESSAGE = "log full — start a new game"
+
+RESET_TOKEN = "new-game"
+
+
+def _fail(message: str, code: int) -> int:
+    sys.stderr.write(f"drain: {message}\n")
+    return code
+
+
+def sanitize_handle(login) -> str:
+    """SPEC 5.3: [a-zA-Z0-9-]{1,39}; strip, truncate, fall back."""
+    if not isinstance(login, str):
+        return HANDLE_FALLBACK
+    cleaned = _HANDLE_STRIP_RE.sub("", login)[:HANDLE_MAX]
+    return cleaned or HANDLE_FALLBACK
+
+
+def parse_timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, _TS_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def reset_token_id(mapping: dict) -> str:
+    """The control token that closes a section, read from the mapping."""
+    for entry in mapping["tokens"]:
+        if entry.get("control") == "reset":
+            return entry["id"]
+    return RESET_TOKEN
+
+
+def validate_title(title: str, mapping_path: Path, workdir: Path):
+    """Re-validate a title through parse_title.py. Returns (rc, payload)."""
+    payload_path = workdir / "title.json"
+    payload_path.write_text(json.dumps({"title": title}), encoding="utf-8")
+    env = dict(os.environ)
+    env.pop("DOOM_TITLE", None)  # the JSON file is the only transport
+    proc = subprocess.run(
+        [sys.executable, str(PARSER_PATH),
+         "--json", str(payload_path), "--mapping", str(mapping_path)],
+        capture_output=True,
+        env=env,
+    )
+    try:
+        parsed = json.loads(proc.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        parsed = None
+    return proc.returncode, parsed
+
+
+def eligible_issues(raw_issues):
+    """Well-formed, ``doom: ``-prefixed issues, ascending by number, deduped."""
+    picked = {}
+    for record in raw_issues:
+        if not isinstance(record, dict):
+            continue
+        number = record.get("number")
+        title = record.get("title")
+        user = record.get("user")
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            continue
+        if not isinstance(title, str) or not title.startswith(TITLE_PREFIX):
+            continue
+        created_at = parse_timestamp(record.get("created_at"))
+        if created_at is None:
+            continue
+        if not isinstance(user, dict):
+            continue
+        if number in picked:
+            continue
+        picked[number] = {
+            "number": number,
+            "title": title,
+            "created_at": created_at,
+            "created_at_text": record["created_at"],
+            "handle": sanitize_handle(user.get("login")),
+        }
+    return [picked[number] for number in sorted(picked)]
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    handle, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".doom-drain-")
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(add_help=True, description=__doc__)
+    parser.add_argument("--issues", required=True)
+    parser.add_argument("--ledger", required=True)
+    parser.add_argument("--mapping", default=str(gamelog.DEFAULT_MAPPING_PATH))
+    parser.add_argument("--out-moves", dest="out_moves", required=True)
+    parser.add_argument("--out-actions", dest="out_actions", required=True)
+    args = parser.parse_args(argv)
+
+    issues_path = Path(args.issues)
+    ledger_path = Path(args.ledger)
+    mapping_path = Path(args.mapping)
+    for label, path in (("issues", issues_path), ("ledger", ledger_path),
+                        ("mapping", mapping_path)):
+        if not path.is_file():
+            return _fail(f"{label} file not found", EXIT_USAGE)
+    if not PARSER_PATH.is_file():
+        return _fail("parse_title.py is missing", EXIT_USAGE)
+
+    try:
+        mapping = gamelog.load_mapping(mapping_path)
+    except (OSError, ValueError):
+        return _fail("mapping file is unreadable", EXIT_USAGE)
+    try:
+        knobs = mapping["knobs"]
+        cap = int(knobs["drain_cap_issues_per_run"])
+        cooldown = timedelta(minutes=int(knobs["new_game_cooldown_minutes"]))
+        section_cap = int(knobs["section_cap_frames"])
+        mapping_version = int(mapping["mapping_version"])
+        frames_per_token = gamelog.token_frames(mapping)
+    except (KeyError, TypeError, ValueError):
+        return _fail("mapping file has no usable knob table", EXIT_USAGE)
+    reset_id = reset_token_id(mapping)
+
+    try:
+        raw_issues = json.loads(issues_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return _fail("issues file is not valid JSON", EXIT_CORRUPT)
+    if not isinstance(raw_issues, list):
+        return _fail("issues file must hold a JSON array", EXIT_CORRUPT)
+
+    try:
+        ledger_text = ledger_path.read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return _fail("ledger file is unreadable or not ASCII", EXIT_CORRUPT)
+    try:
+        log = gamelog.parse_log(ledger_text, mapping)
+    except ValueError as exc:
+        return _fail(f"corrupt ledger: {exc}", EXIT_CORRUPT)
+
+    ledgered = set()
+    last_reset = None
+    for section in log.sections:
+        for entry in section.entries:
+            ledgered.add(entry.issue)
+            if entry.token == reset_id:
+                last_reset = parse_timestamp(entry.ts)
+    section_frames = sum(
+        frames_per_token.get(entry.token, 0) * entry.count
+        for entry in log.sections[-1].entries
+    )
+
+    moves = []
+    move_lines = []
+    post_push = []
+    taken = 0
+
+    with tempfile.TemporaryDirectory(prefix="doom-drain-") as workdir_name:
+        workdir = Path(workdir_name)
+        for issue in eligible_issues(raw_issues):
+            number = issue["number"]
+            if number in ledgered:
+                post_push.append({"issue": number, "action": ACTION_DUPLICATE,
+                                  "message": None})
+                continue
+            if taken >= cap:
+                continue  # left open for the next run; no action of any kind
+            taken += 1
+
+            code, parsed = validate_title(issue["title"], mapping_path, workdir)
+            if code == 1 and isinstance(parsed, dict):
+                post_push.append({"issue": number, "action": ACTION_REJECT,
+                                  "message": parsed.get("message")})
+                continue
+            if code != 0 or not isinstance(parsed, dict) or parsed.get("ok") is not True:
+                return _fail("parse_title.py failed to classify a title", EXIT_USAGE)
+
+            token = parsed["token"]
+            count = int(parsed["count"])
+
+            if token == reset_id:
+                if last_reset is not None and issue["created_at"] - last_reset < cooldown:
+                    post_push.append({
+                        "issue": number,
+                        "action": ACTION_REJECT,
+                        "message": (
+                            "the game was reset recently — new game is limited to one "
+                            f"every {int(knobs['new_game_cooldown_minutes'])} minutes"
+                        ),
+                    })
+                    continue
+                last_reset = issue["created_at"]
+                section_frames = 0
+            elif section_frames >= section_cap:
+                post_push.append({"issue": number, "action": ACTION_REJECT,
+                                  "message": LOG_FULL_MESSAGE})
+                continue
+            else:
+                section_frames += frames_per_token[token] * count
+
+            entry = gamelog.Entry(
+                ts=issue["created_at_text"],
+                handle=issue["handle"],
+                token=token,
+                count=count,
+                issue=number,
+            )
+            try:
+                move_lines.append(gamelog.render_ledger_line(entry, mapping))
+            except ValueError:
+                return _fail("refused to emit a non-canonical ledger line", EXIT_USAGE)
+            moves.append({"issue": number, "token": token, "count": count})
+            post_push.append({"issue": number, "action": ACTION_APPLIED,
+                              "message": None})
+
+    post_push.sort(key=lambda item: item["issue"])
+    moves_blob = ("\n".join(move_lines) + "\n").encode("ascii") if move_lines else b""
+    actions_blob = (json.dumps(
+        {"mapping_version": mapping_version, "moves": moves, "post_push": post_push},
+        ensure_ascii=True,
+        indent=2,
+        sort_keys=False,
+    ) + "\n").encode("ascii")
+
+    try:
+        atomic_write_bytes(Path(args.out_moves), moves_blob)
+        atomic_write_bytes(Path(args.out_actions), actions_blob)
+    except OSError:
+        return _fail("could not write the output files", EXIT_USAGE)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
