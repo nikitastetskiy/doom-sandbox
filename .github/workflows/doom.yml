@@ -465,14 +465,41 @@ jobs:
           # public grammar - no token expands to the menu keys e/x. Fail loudly
           # rather than silently rendering the title screen for every player.
           bootstrap="$(jq -r '.engine.bootstrap_stream // empty' "${TOOLCHAIN}")"
-          if [ -z "$bootstrap" ]; then
-            echo "::error::${TOOLCHAIN} .engine.bootstrap_stream is missing - without the recorded boot-to-gameplay prefix the replay renders the menu, silently. See the E5 report."
+          bootstrap_frames="$(jq -r '.engine.bootstrap_frames // empty' "${TOOLCHAIN}")"
+          if [ -z "$bootstrap" ] || [ -z "$bootstrap_frames" ]; then
+            echo "::error::${TOOLCHAIN} is missing .engine.bootstrap_stream or .engine.bootstrap_frames - without the recorded boot-to-gameplay prefix and its length the replay renders the menu, silently."
             exit 1
           fi
 
+          # The preamble is prepended to the section's own stream. An empty
+          # section (every `new game` rollover) leaves stream.txt as a bare LF,
+          # so the separator is only correct when there is something to separate
+          # - otherwise it would append a phantom empty frame and skew the
+          # frame arithmetic below.
           input="${RUNNER_TEMP}/sim.stream"
-          printf '%s,' "$bootstrap" > "$input"
-          cat "${STREAM}" >> "$input"
+          if [ -s "${STREAM}" ] && [ "$(cat "${STREAM}")" != "" ]; then
+            printf '%s,' "$bootstrap" > "$input"
+            cat "${STREAM}" >> "$input"
+          else
+            printf '%s\n' "$bootstrap" > "$input"
+          fi
+          n_frames=$(( $(tr -cd ',' < "$input" | wc -c) + 1 ))
+          n_record=$(( max_tail * fps ))
+
+          # -nstart is NOT optional. Left to itself the engine computes
+          # n_start = n_frames - n_record, which goes NEGATIVE whenever the
+          # section is shorter than the tail window - and a negative start
+          # records from frame 0, i.e. from the menu walk. That is the state
+          # immediately after every `new game`, so the profile's first-ever
+          # visitor would be shown the Freedoom title screen. Floor it at the
+          # preamble length so the published tail can never reach back into it.
+          n_start=$(( n_frames - n_record ))
+          if [ "$n_start" -lt "$bootstrap_frames" ]; then n_start="$bootstrap_frames"; fi
+          # An entry-less section has nothing after the preamble, and the engine
+          # records the half-open window [n_start, n_frames) - so leave it one
+          # frame to render: the last preamble frame is already the in-level
+          # game-start view SPEC 5.5 calls for on a rollover recovery.
+          if [ "$n_start" -ge "$n_frames" ]; then n_start=$(( n_frames - 1 )); fi
 
           shim="${RUNNER_TEMP}/shim"
           mkdir -p "$shim"
@@ -484,10 +511,27 @@ jobs:
           PATH="${shim}:${PATH}" "${ENGINE_BIN}" \
             -iwad "$wad" \
             -input "$input" \
-            -nrecord "$(( max_tail * fps ))" \
+            -nstart "$n_start" \
+            -nrecord "$n_record" \
             -output "${RUNNER_TEMP}/capture.raw" < /dev/null
 
           test -s "${RUNNER_TEMP}/capture.raw" || { echo "::error::the replay produced no frames"; exit 1; }
+          frame_bytes=$(( width * height * 4 ))
+          captured=$(( $(stat -c%s "${RUNNER_TEMP}/capture.raw") / frame_bytes ))
+          echo "simulated ${n_frames} frame(s); recorded [${n_start}, ${n_frames}) = ${captured}"
+
+          # Hold the final frame out to one second when the section is shorter
+          # than that. ffmpeg cannot write a GIF from a single input frame at
+          # all (it exits non-zero with an empty file), and a sub-second clip is
+          # a blink. Padding is display-only: GIF bytes are explicitly outside
+          # the determinism guarantee, and the ledger and stream are untouched.
+          if [ "$captured" -lt "$fps" ]; then
+            tail -c "$frame_bytes" "${RUNNER_TEMP}/capture.raw" > "${RUNNER_TEMP}/hold.raw"
+            for _ in $(seq $(( fps - captured ))); do
+              cat "${RUNNER_TEMP}/hold.raw" >> "${RUNNER_TEMP}/capture.raw"
+            done
+            echo "held the final frame out to ${fps} frame(s) for a legible still"
+          fi
           {
             echo "fps=${fps}"
             echo "width=${width}"
@@ -523,6 +567,17 @@ jobs:
               | "${FFMPEG_BIN}" -hide_banner -nostdin -loglevel error -y \
                   -f rawvideo -framerate "${FPS}" -s "${WIDTH}x${HEIGHT}" -pix_fmt bgr0 -i - \
                   -filter_complex "$graph" -loop 0 -f gif "$gif"
+
+            # budget.py is a ceiling check, so a degenerate encode passes it:
+            # a 0-byte or truncated GIF is trivially under 4,000,000 bytes and
+            # would publish clean. Assert the file is structurally a GIF before
+            # asking whether it fits. (A silent palette collapse still produces
+            # a well-formed small GIF - that one is prevented upstream by the
+            # pinned -pix_fmt bgr0 and caught by the sandbox rehearsal.)
+            if [ ! -s "$gif" ] || [ "$(head -c 6 "$gif")" != "GIF89a" ]; then
+              echo "::error::${rung} produced no usable GIF - the encode failed structurally, nothing is published"
+              exit 1
+            fi
 
             rc=0
             python3 game/scripts/budget.py --mapping "${MAPPING}" --rung "$rung" --file "$gif" || rc=$?
