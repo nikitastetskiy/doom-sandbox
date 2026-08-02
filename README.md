@@ -17,6 +17,22 @@
 <img src="octocat.gif" width="15px">
 </p>
 
+<h2 align="center">🎮 Playable DOOM</h2>
+
+<p align="center">
+  <sub><strong>How to play:</strong> click a control, then press <strong>Submit</strong> on the pre-filled issue — your move runs automatically.</sub>
+</p>
+
+<!-- DOOM:START -->
+
+<p align="center">
+  <img src="game/assets/screens/paused.png" alt="DOOM (PAUSED)" />
+</p>
+
+🕹️ Controls are being wired up — the arcade opens soon.
+
+<!-- DOOM:END -->
+
 <!--
 **nikitastetskiy/nikitastetskiy** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
 
