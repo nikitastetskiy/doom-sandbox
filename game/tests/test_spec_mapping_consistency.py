@@ -540,6 +540,28 @@ def test_budget_ceiling_matches_spec():
     )
 
 
+def test_budget_floor_matches_spec():
+    spec_value = to_int(
+        extract(r"Hard byte floor: ([\d,]+) bytes", field="budget.floor_bytes")
+    )
+    json_value = mapping()["budget"]["floor_bytes"]
+    assert json_value == spec_value, (
+        f"DRIFT [budget.floor_bytes]: mapping/v1.json has {json_value} — "
+        f"game/SPEC.md §12 states {spec_value}"
+    )
+
+
+def test_budget_floor_is_below_the_ceiling():
+    budget = mapping()["budget"]
+    assert budget["floor_bytes"] < budget["ceiling_bytes"], (
+        f"DRIFT [budget]: floor_bytes {budget['floor_bytes']} is not below "
+        f"ceiling_bytes {budget['ceiling_bytes']} — the publish band is empty"
+    )
+    assert budget["floor_bytes"] > 0, (
+        "DRIFT [budget.floor_bytes]: a non-positive floor gates nothing"
+    )
+
+
 def test_ladder_rung_count_matches_spec():
     spec_rungs = spec_ladder()
     json_rungs = mapping()["budget"]["ladder"]

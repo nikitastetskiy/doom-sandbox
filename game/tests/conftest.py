@@ -83,6 +83,11 @@ CONTROL_TABLE_ROWS = 4
 
 # SPEC section 12 / RFC D7: budget constants (normative, untouchable)
 BUDGET_CEILING_BYTES = 4_000_000
+BUDGET_FLOOR_BYTES = 16_000  # SPEC 12: mapping budget.floor_bytes
+# SPEC 12.1 measured reference points that fix the discriminating band.
+STILL_FRAME_BYTES = 46_000       # legitimate single-frame still — MUST publish
+CLIP_18_FRAME_BYTES = 276_000    # legitimate 18-frame clip — MUST publish
+COLLAPSE_SIGNATURE_BYTES = 3_000  # recorded palette-collapse signature — MUST fail
 LADDER_LEVELS = ("L0", "L1", "L2")
 # px/fps/colors per rung -- identical in both the E1 and the E2-adjusted SPEC;
 # tail_seconds is plan-tunable and therefore consumed from mapping/v1.json.
@@ -295,11 +300,23 @@ def run_budget(rung, *, size=None, file=None, mapping=MAPPING_PATH):
     return run_script("budget.py", args)
 
 
-def sparse_file(tmp_path, name, size):
-    """Create a file of exactly `size` bytes without writing `size` bytes."""
+GIF89A_MAGIC = b"GIF89a"  # SPEC 12.1 gate step 1
+
+
+def sparse_file(tmp_path, name, size, *, magic=GIF89A_MAGIC):
+    """Create a file of exactly `size` bytes without writing `size` bytes.
+
+    Fixtures carry the GIF89a magic by default so they satisfy SPEC 12.1 gate
+    step 1 (structural validity) wherever it is enforced — the spec permits it
+    in the workflow OR in the script, and these fixtures must not force that
+    choice. Pass magic=b"" to build a deliberately degenerate artifact.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / name
+    head = magic[:size] if size else b""
     with open(path, "wb") as fh:
-        if size:
+        fh.write(head)
+        if size > len(head):
             fh.seek(size - 1)
             fh.write(b"\0")
     assert path.stat().st_size == size
