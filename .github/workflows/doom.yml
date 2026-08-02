@@ -336,10 +336,21 @@ jobs:
           # through the parser, new-game cooldown and section cap, ledger lines
           # out, and a post_push plan whose GitHub side effects this workflow
           # executes strictly after the pushes.
+          #
+          # --toolchain is how the drain computes SEALED mode (SPEC 5.5):
+          # it compares the current section header against the committed pins
+          # and, when they disagree, admits only `doom: new game` and
+          # close-rejects everything else instead of failing the run - refusing
+          # the batch would livelock, since the drain is ascending by issue
+          # number and would re-refuse the same low-numbered issue forever.
+          # This runs BEFORE the toolchain restore on purpose: the comparand is
+          # the checked-out game/toolchain.json, not the restored binary, so an
+          # idle sweep still exits without ever touching the engine cache.
           python3 game/scripts/drain.py \
             --issues "${RUNNER_TEMP}/issues.json" \
             --ledger "${LEDGER}" \
             --mapping "${MAPPING}" \
+            --toolchain "${TOOLCHAIN}" \
             --out-moves "${RUNNER_TEMP}/moves.txt" \
             --out-actions "${RUNNER_TEMP}/actions.json"
 
