@@ -228,6 +228,16 @@ def block_bounds_bytes(data: bytes):
 
 
 def outside_parts_bytes(data: bytes):
+    """(before, after) — everything the rewriter must leave byte-identical.
+
+    NOTE: both parts INCLUDE their marker line (`before` ends with
+    "<!-- DOOM:START -->\\n"; `after` begins with "<!-- DOOM:END -->\\n"), by
+    design — the marker lines are themselves outside-the-block bytes and must
+    survive every rewrite. Compare helper output against helper output
+    (`outside_parts_bytes(rewritten) == outside_parts_bytes(original)`), never
+    against a raw prefix/suffix you passed to make_readme_bytes(): those do not
+    include the marker lines and the comparison will fail spuriously.
+    """
     start, end = block_bounds_bytes(data)
     return data[:start], data[end:]
 

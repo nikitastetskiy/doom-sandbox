@@ -180,9 +180,14 @@ def test_unicode_and_crlf_outside_markers_survive_byte_exact(tmp_path):
     path = write_readme(tmp_path, original)
     assert run_rewriter(path, state="LIVE", image_url=GIF_URL).returncode == 0
     rewritten = path.read_bytes()
+    # Byte-exact on the whole outside region, marker lines included.
+    assert outside_parts_bytes(rewritten) == outside_parts_bytes(original)
+    # ...and the payloads themselves survive verbatim: no unicode normalization,
+    # no CRLF->LF rewriting, no re-encoding of the surrounding profile content.
     out_prefix, out_suffix = outside_parts_bytes(rewritten)
-    assert out_prefix == prefix
-    assert out_suffix.endswith(suffix)
+    assert out_prefix.startswith(prefix), "unicode/CRLF prefix payload was altered"
+    assert out_suffix.endswith(suffix), "unicode/CRLF suffix payload was altered"
+    assert rewritten.count(prefix) == 1 and rewritten.count(suffix) == 1
 
 
 # --- Control-table rendering (SPEC section 9, plan D5) ----------------------
