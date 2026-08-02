@@ -58,6 +58,8 @@ DRAIN_CAP_ISSUES_PER_RUN = 20
 SECTION_CAP_FRAMES = 120_000
 PUSH_RETRY_ATTEMPTS = 3
 LOG_FULL_MESSAGE = "log full — start a new game"  # SPEC section 6, verbatim
+# SPEC 5.5 rule 3, verbatim — no interpolation, parallel to LOG_FULL_MESSAGE
+SEALED_MESSAGE = "the arcade is being upgraded — press New game to continue"
 
 # SPEC section 9: control table
 ISSUE_URL_PREFIX = "https://github.com/nikitastetskiy/nikitastetskiy/issues/new?title="
@@ -191,6 +193,32 @@ def ledger_line(ts, handle, token, count, issue):
     return f"{ts} {handle} {token} {count} #{issue}"
 
 
+def make_toolchain(tmp_path, *, engine=ENGINE_HEX, wad=WAD_HEX, build=BUILD_HEX,
+                   name="toolchain.json"):
+    """Minimal game/toolchain.json shape carrying the pins SPEC 5.5 compares.
+
+    Defaults match the section_header() defaults, so a ledger built with
+    make_section_text() is NOT sealed against this toolchain. Override any pin
+    to seal the current section.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    path = tmp_path / name
+    path.write_text(json.dumps({
+        "toolchain_version": 1,
+        "runner_image": "ubuntu-24.04",
+        "engine": {"commit_sha": engine,
+                   "build_sha256": {"value": build, "status": "provisional_local"}},
+        "wad": {"file": "game/assets/freedoom1.wad", "sha256": wad},
+    }), encoding="utf-8")
+    return path
+
+
+def sealed_section_text(lines=(), n=1, engine="99" * 20, mapping=MAPPING_VERSION):
+    """A section whose header pins disagree with make_toolchain()'s defaults."""
+    header = section_header(n=n, engine=engine, mapping=mapping)
+    return "\n".join([header, *lines]) + "\n"
+
+
 def make_section_text(lines, n=1, mapping=MAPPING_VERSION):
     """One SPEC 5.1 section: header + ledger lines, LF-joined, one trailing LF."""
     return "\n".join([section_header(n=n, mapping=mapping), *lines]) + "\n"
@@ -285,17 +313,24 @@ def make_issue(number, title, created_at, login="visitor"):
             "user": {"login": login}}
 
 
-def run_drain(tmp_path, issues, ledger_text, *, mapping=MAPPING_PATH, extra_args=()):
+def run_drain(tmp_path, issues, ledger_text, *, mapping=MAPPING_PATH, toolchain=None,
+              extra_args=()):
+    """Run drain.py. `toolchain` defaults to pins that MATCH section_header(),
+    so callers that do not care about SPEC 5.5 sealing get an unsealed run."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
     issues_path = tmp_path / "issues.json"
     issues_path.write_text(json.dumps(issues), encoding="utf-8")
     ledger_path = tmp_path / "log.txt"
     ledger_path.write_text(ledger_text, encoding="ascii")
     moves_path = tmp_path / "moves.out"
     actions_path = tmp_path / "actions.json"
+    if toolchain is None:
+        toolchain = make_toolchain(tmp_path)
     proc = run_script(
         "drain.py",
         ["--issues", str(issues_path), "--ledger", str(ledger_path),
-         "--mapping", str(mapping), "--out-moves", str(moves_path),
+         "--mapping", str(mapping), "--toolchain", str(toolchain),
+         "--out-moves", str(moves_path),
          "--out-actions", str(actions_path), *extra_args],
     )
     return proc, moves_path, actions_path

@@ -1,7 +1,7 @@
 """
 @spec-handoff
 @interface rewrite_readme.py --readme PATH --mapping PATH --state
-    {LIVE,PAUSED,UNAVAILABLE,LOG_FULL} --image-url URL [--controls-enabled];
+    {LIVE,PAUSED,UNAVAILABLE,LOG_FULL,SEALED} --image-url URL [--controls-enabled];
     exit 0 ok / 2 usage / 6 marker-validation failure; stdout JSON {"ok": true}
     or {"ok": false, "marker_error": missing-start|missing-end|duplicate-start|
     duplicate-end|reversed} (classes checked in that order, substring counts)
@@ -26,7 +26,12 @@
     - Marker text quoted anywhere else in the file (prose or code fence) ->
       duplicate class -> abort untouched; missing final newline after the END
       marker region is preserved byte-exact
-@see game/SPEC.md section 9; game/mapping/v1.json control_links; RFC must_have 8
+    - SEALED is the SPEC §11 guidance screen shown while the current section is
+      sealed by a pin mismatch (§5.5). It is distinct from UNAVAILABLE (moves
+      ARE being processed) and from LOG_FULL (the section is not full — its
+      toolchain moved), and needs its own screen asset, parallel to LOG_FULL
+@see game/SPEC.md sections 9 and 11; §5.5 (sealed sections);
+    game/mapping/v1.json control_links; RFC must_have 8
 """
 
 import urllib.parse
@@ -165,7 +170,7 @@ def test_state_screen_swap_rewrites_only_inside_markers(tmp_path):
     assert b"DOOM (LIVE)" in inside_block_bytes(live)
 
 
-@pytest.mark.parametrize("state", ["LIVE", "PAUSED", "UNAVAILABLE", "LOG_FULL"])
+@pytest.mark.parametrize("state", ["LIVE", "PAUSED", "UNAVAILABLE", "LOG_FULL", "SEALED"])
 def test_every_state_renders_with_fixed_alt_text(tmp_path, state):
     path = write_readme(tmp_path, make_readme_bytes())
     proc = run_rewriter(path, state=state, image_url="https://example.com/s.png")

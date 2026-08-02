@@ -34,24 +34,37 @@
       successful run, satisfying the RFC-normative
       `stream == expand(ledger, mapping_version)` CI invariant. An entry-less
       current section yields exactly b"\\n" (zero frames, no commas, one LF)
-    - PIN GUARD: before appending, the CURRENT section header's engine/build/
-      wad/mapping are compared against the running toolchain. Any disagreement
-      ⇒ exit 7 with no writes, so a swapped engine can never silently fork the
-      timeline (RFC determinism guarantees; SPEC §5.2)
+    - SEALED SECTIONS (SPEC §5.5, normative — ratified in 5e2c68f). A section
+      is SEALED when any header field (engine/build/wad/mapping) disagrees with
+      the running toolchain (--toolchain plus --engine-build-sha256, and the
+      mapping file's mapping_version). Sealing is computed at run time and is
+      never stored. Then:
+      * rule 1 — a sealed section never advances and is never re-simulated: no
+        frame-contributing line may be appended to it, and --stream is NOT
+        regenerated while sealed (leave the file byte-untouched, even if the
+        current contents look stale). Its committed pins stay verbatim so it
+        remains reproducible against the archived build that produced it
+      * rule 2 — the sole admissible line is a `new-game` directive. It
+        contributes zero frames, so it cannot alter the sealed section's replay
+        output. It is appended as that section's final line and the next header
+        is written with the RUNNING pins: the only legitimate way a pin change
+        enters the log
+      * rule 4 — DEFENSE IN DEPTH: if any frame-contributing line would land in
+        a sealed section, exit 7 with the ledger and stream byte-unchanged.
+        Correct drain behaviour sealed-rejects those in-band (drain rule 3), so
+        this path should never trigger; implement it anyway
+      * rule 5 — once the reset opens a fresh section its pins match by
+        construction, so later lines in the same batch land there and are
+        simulated normally
 @edge-cases
-    - Empty --moves file: no-op append, but the stream is still regenerated
-      from the current section and exit is 0 (idempotent re-render)
-    - Zero-frame exemption (SEE SPEC GAP note below): when the pins mismatch,
-      the run is still refused UNLESS every line that would land in the stale
-      section contributes zero frames — i.e. the batch begins with a
-      `new-game` directive. A zero-frame control line cannot alter that
-      section's replay output, so it cannot fork the timeline, and permitting
-      exactly this keeps the RFC's "engine bump ⇒ forced new game" reachable
-      in-band. Any frame-contributing move against mismatched pins is refused
+    - Empty --moves file on an UNSEALED section: no-op append, stream still
+      regenerated, exit 0 (idempotent re-render)
+    - Rollover recovery render: the fresh section is empty, so the recovery run
+      replays zero frames and --stream becomes exactly b"\\n"; the sealed
+      section's frames are never re-expanded
     - A moves line that is not canonical per gamelog ⇒ exit 5, no writes
-    - Rollover with trailing moves: lines after the `new-game` directive land
-      in the NEW section and count toward the new stream
-@see game/SPEC.md §1, §5.1-5.4; RFC 001 determinism guarantees + D13/D14;
+@see game/SPEC.md §1, §5.1-5.5 (§5.5 is the normative sealed-section ruling);
+    RFC 001 determinism guarantees + D13/D14;
     .github/workflows/doom.yml (frozen call site); game/scripts/gamelog.py
 """
 
@@ -65,6 +78,7 @@ from conftest import (
     MAPPING_PATH,
     WAD_HEX,
     expected_stream_text,
+    make_toolchain,
     import_gamelog,
     ledger_line,
     make_section_text,
@@ -73,21 +87,6 @@ from conftest import (
 )
 
 TS = "2026-08-02T14:02:11Z"
-
-
-def make_toolchain(tmp_path, *, engine=ENGINE_HEX, wad=WAD_HEX, build=BUILD_HEX,
-                   name="toolchain.json"):
-    """Minimal shape mirroring the real game/toolchain.json pin fields."""
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    path = tmp_path / name
-    path.write_text(json.dumps({
-        "toolchain_version": 1,
-        "runner_image": "ubuntu-24.04",
-        "engine": {"commit_sha": engine, "build_sha256": {"value": build,
-                                                          "status": "provisional_local"}},
-        "wad": {"file": "game/assets/freedoom1.wad", "sha256": wad},
-    }), encoding="utf-8")
-    return path
 
 
 def run_apply(tmp_path, ledger_text, moves_text, *, engine=ENGINE_HEX, wad=WAD_HEX,
@@ -408,8 +407,14 @@ def test_zero_frame_reset_is_the_sanctioned_rollover_under_mismatched_pins(tmp_p
 
 
 def test_frame_contributing_move_before_a_reset_is_still_refused(tmp_path):
-    """The exemption is strictly zero-frame: a real move ahead of the reset
-    would land in the mismatched section and IS a timeline fork."""
+    """DEFENSE IN DEPTH (SPEC 5.5 rule 4), not the primary policy path.
+
+    Correct drain behaviour sealed-rejects a frame-contributing move in-band
+    (SPEC 5.5 rule 3), so apply_moves should never receive such a batch. If it
+    does — a drain bug, a hand-made moves file, an operator dispatch — it
+    refuses with exit 7 and leaves the ledger byte-unchanged rather than
+    advancing a sealed section.
+    """
     early = ledger_line(TS, "alice", "fire", 1, 19)
     reset = ledger_line("2026-08-02T14:05:00Z", "bob", "new-game", 1, 20)
     before = one_section()
@@ -418,6 +423,48 @@ def test_frame_contributing_move_before_a_reset_is_still_refused(tmp_path):
     )
     assert proc.returncode == 7, (proc.stdout, proc.stderr)
     assert ledger.read_text(encoding="ascii") == before
+
+
+def test_sealed_section_stream_is_not_regenerated(tmp_path):
+    """SPEC 5.5 rule 1: a sealed section is never re-simulated and its
+    stream.txt is not regenerated — not even to a 'correct' value."""
+    before = one_section([ledger_line("2026-08-02T09:00:00Z", "carol", "fire", 1, 5)])
+    proc, ledger, stream = run_apply(
+        tmp_path, before, ledger_line(TS, "alice", "forward", 1, 11) + "\n",
+        engine="99" * 20, stream_text="deliberately-stale\n",
+    )
+    assert proc.returncode == 7
+    assert stream.read_text(encoding="ascii") == "deliberately-stale\n"
+    assert ledger.read_text(encoding="ascii") == before
+
+
+def test_sanctioned_rollover_renders_the_fresh_empty_section(tmp_path):
+    """SPEC 5.5 'rollover recovery render': the fresh section is empty, so the
+    recovery run replays zero frames — the sealed section is never re-expanded."""
+    sealed_move = ledger_line("2026-08-02T09:00:00Z", "carol", "forward", 5, 5)
+    before = one_section([sealed_move])
+    reset = ledger_line(TS, "alice", "new-game", 1, 20)
+    proc, ledger, stream = run_apply(
+        tmp_path, before, reset + "\n", engine="99" * 20, stream_text="stale\n",
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert stream.read_bytes() == b"\n", "zero frames: the fresh section is empty"
+    assert "u" not in stream.read_text(encoding="ascii"), "sealed frames never re-expanded"
+    assert sealed_move in ledger.read_text(encoding="ascii"), "sealed lines preserved verbatim"
+
+
+def test_moves_after_a_sanctioned_rollover_apply_normally(tmp_path):
+    """SPEC 5.5 rule 5: the fresh section's pins match by construction."""
+    reset = ledger_line(TS, "alice", "new-game", 1, 20)
+    later = ledger_line("2026-08-02T14:10:00Z", "bob", "fire", 1, 21)
+    proc, ledger, stream = run_apply(
+        tmp_path, one_section(), reset + "\n" + later + "\n", engine="99" * 20,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert stream.read_text(encoding="ascii") == expected_stream_text([("fire", 1)])
+    gamelog = import_gamelog()
+    log = gamelog.parse_log(ledger.read_text(encoding="ascii"))
+    assert [e.issue for e in log.sections[-1].entries] == [21]
 
 
 # --- Input validation ---------------------------------------------------------------
