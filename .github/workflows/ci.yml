@@ -11,9 +11,12 @@
 #   4. spec-mapping-consistency - game/SPEC.md <-> game/mapping/v1.json value
 #                                 drift guard; its own check so a failure says
 #                                 "spec drift", not "a test failed"
-#   5. golden-frame             - determinism observable (must_have 2), and the
-#                                 job that captures the canonical ubuntu-24.04
-#                                 engine build hash for plan D9
+#   5. golden-frame             - determinism observable (must_have 2). It is a
+#                                 CONSUMER of the SPEC 5.9 replay-equivalence
+#                                 gate, which has exactly one implementation
+#                                 site (.github/actions/doom-toolchain); this
+#                                 job reads the verdict rather than re-running
+#                                 the comparison (SPEC 0.5)
 #   6. actionlint               - workflow static analysis
 #   7. zizmor                   - workflow security analysis
 #
@@ -47,6 +50,12 @@ env:
   # Exact pins. Nothing floats: a linter that changes under us turns a green
   # pipeline red for reasons that have nothing to do with the change.
   PYTEST_VERSION: '9.1.1'
+  # The workflow-contract suite cross-checks its own YAML extractor against a
+  # real parser. Without PyYAML that check `importorskip`s, and CI silently
+  # loses the one assertion that the extractor returns the SHIPPED BYTES rather
+  # than a plausible rendering of them - every other workflow test would still
+  # pass against a subtly wrong extraction.
+  PYYAML_VERSION: '6.0.3'
   ZIZMOR_VERSION: '1.29.0'
   ACTIONLINT_VERSION: '1.7.12'
   ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
@@ -72,10 +81,16 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install pytest
-        run: python3 -m pip install --disable-pip-version-check --quiet "pytest==${PYTEST_VERSION}"
+        # PyYAML is not a test-runner dependency; it is the workflow-contract
+        # suite's independent parser for the extractor cross-check. This is the
+        # only job that runs the full glob, so it is the only one that needs it.
+        run: |
+          python3 -m pip install --disable-pip-version-check --quiet \
+            "pytest==${PYTEST_VERSION}" "pyyaml==${PYYAML_VERSION}"
       - name: Run the full suite
-        # The golden-frame test loud-skips here (no engine binary in this job);
-        # the golden-frame job below is where it actually executes.
+        # The golden-frame test loud-skips here (no engine binary in this job).
+        # Its executing site is the SPEC 5.9 gate inside the doom-toolchain
+        # action, which the golden-frame job below consumes.
         run: python3 -m pytest game/tests/ -q
 
   stream-invariant:
@@ -159,31 +174,64 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Set up the pinned Python
-        # ubuntu-24.04's system interpreter is PEP 668 externally-managed, so a
-        # bare `pip install` there is a coin flip. setup-python provides a
-        # tool-cache interpreter that pip owns outright.
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-      - name: Install pytest
-        run: python3 -m pip install --disable-pip-version-check --quiet "pytest==${PYTEST_VERSION}"
+      # No setup-python and no pytest here on purpose. This job no longer runs
+      # a test; it runs the toolchain action and reads its verdict. The action
+      # needs jq, sha256sum, git, make, clang and the system python3 (for the
+      # ffmpeg PATH shim), all present on ubuntu-24.04.
       - name: Restore the pinned toolchain
         id: toolchain
-        # Same exact-key, verify-or-rebuild path doom.yml uses - so the hash
-        # this job reports is the hash the game will actually run on. ffmpeg is
-        # not needed: the test captures raw frames through its own shim.
+        # Same exact-key, verify-or-rebuild path doom.yml uses - so the binary
+        # this job judges is the binary the game will actually run on. ffmpeg
+        # is not needed: the replay captures raw frames through the PATH shim.
+        #
+        # SPEC 5.9's gate lives INSIDE this action: on the from-source path it
+        # replays game/tests/fixtures/golden.stream and compares the recorded
+        # framebuffer digest against golden.expected.json, failing the job on a
+        # divergence. This job used to re-implement that comparison in pytest -
+        # a second site for one predicate, which SPEC 0.5 forbids for the exact
+        # reason it names: the fix lands on one copy, the other stays wrong, and
+        # the prose claims both are covered.
         uses: ./.github/actions/doom-toolchain
         with:
           need-ffmpeg: 'false'
-      - name: Replay the fixture and compare checksums
+      - name: Assert the replay-equivalence verdict
         env:
-          DOOM_ENGINE_BIN: ${{ steps.toolchain.outputs.engine-bin }}
-        # Identical framebuffer checksum at the final frame plus identical
-        # frame count across independent runs on the pinned image: the
-        # measurable meaning of "same game" (must_have 2). This job's summary
-        # carries the built engine SHA-256 that plan D9 captures.
-        run: python3 -m pytest -q game/tests/test_golden_frame.py
+          REPLAY_VERDICT: ${{ steps.toolchain.outputs.engine-replay-verdict }}
+          ENGINE_ORIGIN: ${{ steps.toolchain.outputs.engine-origin }}
+          ENGINE_BUILD_SHA256: ${{ steps.toolchain.outputs.engine-build-sha256 }}
+          PIN_AGREES: ${{ steps.toolchain.outputs.engine-pin-agrees }}
+        # The consumer half. The action already fails the job on a divergence,
+        # so this step exists to make the verdict an EXPLICIT, named check
+        # rather than an absence of failure - "nothing went red" is the weakest
+        # available evidence (SPEC 12.1's standing lesson), and a verdict this
+        # job never reads is a verdict nobody is accountable for.
+        run: |
+          set -euo pipefail
+          case "${REPLAY_VERDICT}" in
+            match)
+              echo "must_have 2 observed directly: the engine built from the pinned commit replayed the committed golden fixture to the committed digest." ;;
+            byte-identical-pin)
+              echo "must_have 2 observed transitively: no replay was needed because the binary verified byte-exact against the recorded pin, and that binary already passed this gate. Byte identity implies behavioural identity (SPEC 5.9)." ;;
+            '')
+              echo "::error::the toolchain action reported no replay verdict at all. An absent verdict is not a passing one - a gate that cannot establish its property has not passed it (SPEC 0)."
+              exit 1 ;;
+            *)
+              echo "::error::unexpected replay verdict '${REPLAY_VERDICT}' - the action should have failed the job before reaching here. Treat this as a defect in the gate itself, not as a verdict about the engine."
+              exit 1 ;;
+          esac
+          {
+            echo "### Golden-frame determinism (must_have 2)"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| replay verdict | \`${REPLAY_VERDICT}\` |"
+            echo "| binary origin | ${ENGINE_ORIGIN} |"
+            echo "| engine build SHA-256 | \`${ENGINE_BUILD_SHA256}\` |"
+            echo "| agrees with recorded pin | ${PIN_AGREES} |"
+            echo ""
+            echo "The build hash is provenance, not the determinism pin (SPEC 5.9): it is a"
+            echo "property of the runner image version. The replay is the pin."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   actionlint:
     name: actionlint
