@@ -32,6 +32,19 @@ its ``action`` and its player-visible ``message``, so the workflow can branch on
 worse, string-matching player-visible prose.  ``reason`` is additive: it never
 replaces ``message`` and the two always agree.
 
+Section state (SPEC 5.8, normative).  The actions JSON carries one further
+top-level member, ``"section": {"state": ...}``, a sibling of
+``mapping_version`` / ``moves`` / ``post_push``.  It is not a seventh reason
+code: a reason code answers *why did this issue close this way* once per drained
+issue, while the section state is one fact per **run** that holds just as firmly
+when nothing was drained -- which is exactly the case it exists for, since the
+``sealed`` and ``section-cap`` codes can only witness a blocked section where
+there happened to be a move to reject.  It is emitted unconditionally on every
+exit-0 drain, it is reported as of the *end* of the batch (so it describes the
+section the next move lands in, and an applied rollover reports ``open``), and
+it is run-local -- never written into ``game/state/``, and not a
+``mapping_version`` bump.
+
 Sealed mode (SPEC 5.5, normative).  ``--toolchain`` is the comparand: when any
 pin in the current section's header (engine / build / wad / mapping) disagrees
 with ``game/toolchain.json`` plus the mapping version, the section is sealed and
@@ -154,6 +167,29 @@ def section_is_sealed(header, engine: str, build: str, wad: str,
     )
 
 
+def section_state(section_states, sealed: bool, at_cap: bool) -> str:
+    """SPEC 5.8: the state of the section the NEXT move will land in.
+
+    ``section_states`` is the mapping's list, normatively in *precedence* order
+    -- sealed beats capped beats open -- so the predicates are tested in that
+    same order and the first that holds wins.  A section can satisfy both of the
+    first two and ``sealed`` must win, which is the order the drain already
+    applies when admitting moves, so the reported state and the admission
+    decision cannot disagree.
+
+    The three strings are read out of the mapping rather than pasted here: the
+    drift guard already pins the mapping against SPEC 5.8, so reading through it
+    means drain.py cannot quietly disagree with the file its consumer looks the
+    value up in.
+    """
+    sealed_state, capped_state, open_state = section_states
+    if sealed:
+        return sealed_state
+    if at_cap:
+        return capped_state
+    return open_state
+
+
 def reset_token_id(mapping: dict) -> str:
     """The control token that closes a section, read from the mapping."""
     for entry in mapping["tokens"]:
@@ -259,6 +295,14 @@ def main(argv=None) -> int:
         frames_per_token = gamelog.token_frames(mapping)
     except (KeyError, TypeError, ValueError):
         return _fail("mapping file has no usable knob table", EXIT_USAGE)
+    # SPEC 5.8: three states, in precedence order.  Refusing to run without them
+    # is deliberate -- the alternative is emitting a state string this script
+    # made up, which is the silent drift the mirrored table exists to prevent.
+    section_states = mapping.get("section_states")
+    if (not isinstance(section_states, list) or len(section_states) != 3
+            or not all(isinstance(state, str) and state
+                       for state in section_states)):
+        return _fail("mapping file has no usable section_states table", EXIT_USAGE)
     reset_id = reset_token_id(mapping)
 
     # SPEC 5.5: the sealing comparand is the checked-out toolchain file, never a
@@ -376,9 +420,20 @@ def main(argv=None) -> int:
             post_push.append(close_entry(number, REASON_APPLIED))
 
     post_push.sort(key=lambda item: item["issue"])
+
+    # SPEC 5.8 clause 3: as of the END of the batch.  ``sealed`` and
+    # ``section_frames`` are the drain loop's own end state, so an applied
+    # rollover reports `open` on the very run that healed the game and a batch
+    # whose applied moves carry the section over the cap reports `capped`.
+    # Reading the pre-loop values instead would describe the section this run
+    # *started* with -- it agrees on every quiet fixture and lies on exactly the
+    # two runs that change something.
+    state = section_state(section_states, sealed, section_frames >= section_cap)
+
     moves_blob = ("\n".join(move_lines) + "\n").encode("ascii") if move_lines else b""
     actions_blob = (json.dumps(
-        {"mapping_version": mapping_version, "moves": moves, "post_push": post_push},
+        {"mapping_version": mapping_version, "moves": moves,
+         "post_push": post_push, "section": {"state": state}},
         ensure_ascii=True,
         indent=2,
         sort_keys=False,
