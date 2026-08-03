@@ -26,8 +26,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GAME_DIR = REPO_ROOT / "game"
 SCRIPTS_DIR = GAME_DIR / "scripts"
 MAPPING_PATH = GAME_DIR / "mapping" / "v1.json"
+TOOLCHAIN_PATH = GAME_DIR / "toolchain.json"
 README_PATH = REPO_ROOT / "README.md"
 FIXTURES_DIR = GAME_DIR / "tests" / "fixtures"  # E2-owned; read-only for E3
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "doom.yml"
 
 # --- SPEC values, pinned VERBATIM (game/SPEC.md sections 1-12) -------------
 MAPPING_VERSION = 1
@@ -395,3 +397,436 @@ def write_mapping(tmp_path, mapping_dict, name="mapping.json"):
     path = tmp_path / name
     path.write_text(json.dumps(mapping_dict), encoding="utf-8")
     return path
+
+
+# --- Workflow harness ------------------------------------------------------
+# The shell that decides what a run does lives in .github/workflows/doom.yml,
+# so a test that hand-transcribes it into Python asserts against a COPY and
+# proves nothing about the file that ships. Every workflow test here extracts
+# the step's `run:` body VERBATIM from the YAML and executes that text. If the
+# workflow is edited, the test executes the edit; there is no second copy to
+# drift. game/tests owns none of doom.yml — these helpers read it, never write.
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _literal_block_at(lines, key_line_index):
+    """Body of the literal block scalar opened on `lines[key_line_index]`.
+
+    Returns the dedented text with a single trailing LF — byte-identical to
+    what a YAML parser yields for `|` / `|-` under this workflow's shapes
+    (asserted against PyYAML by the extraction test, where PyYAML is present).
+    """
+    header = lines[key_line_index].split(":", 1)[1].strip()
+    if header not in ("|", "|-"):
+        return None
+    body, body_indent = [], None
+    for line in lines[key_line_index + 1:]:
+        if not line.strip():
+            body.append("")
+            continue
+        indent = _indent_of(line)
+        if body_indent is None:
+            body_indent = indent
+        if indent < body_indent:
+            break
+        body.append(line[body_indent:])
+    while body and not body[-1]:
+        body.pop()
+    return "\n".join(body) + "\n"
+
+
+def workflow_lines(workflow=WORKFLOW_PATH):
+    return workflow.read_text(encoding="utf-8").splitlines()
+
+
+def workflow_step_run(step_name, workflow=WORKFLOW_PATH):
+    """The `run:` script of the uniquely-named workflow step, verbatim.
+
+    Fails loudly rather than returning something plausible: a silently wrong
+    extraction would run a DIFFERENT script than the one under test and could
+    still go green.
+    """
+    lines = workflow_lines(workflow)
+    start = step_indent = None
+    for index, line in enumerate(lines):
+        if line.strip() == f"- name: {step_name}":
+            assert start is None, f"step name {step_name!r} is not unique in {workflow.name}"
+            start, step_indent = index, _indent_of(line)
+    assert start is not None, f"no step named {step_name!r} in {workflow.name}"
+    key_indent = step_indent + 2
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if line.strip() and _indent_of(line) <= step_indent:
+            break
+        if _indent_of(line) == key_indent and line.strip().startswith("run:"):
+            script = _literal_block_at(lines, index)
+            assert script is not None, (
+                f"step {step_name!r} does not use a literal block scalar for `run:`"
+            )
+            return script
+    raise AssertionError(f"step {step_name!r} has no `run:` script")
+
+
+def workflow_run_blocks(workflow=WORKFLOW_PATH):
+    """[(step name, run script)] for every literal-block `run:` in the file."""
+    lines = workflow_lines(workflow)
+    blocks, current = [], "<unnamed>"
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("- name: "):
+            current = stripped[len("- name: "):]
+        elif stripped.startswith("run:"):
+            script = _literal_block_at(lines, index)
+            if script is not None:
+                blocks.append((current, script))
+    return blocks
+
+
+def workflow_step_field(step_name, field, workflow=WORKFLOW_PATH):
+    """Raw text of a scalar step key (`if:`, `id:`), folded onto one line.
+
+    Only for structural assertions ABOUT the workflow's wiring. Never used to
+    re-evaluate an Actions expression in Python: re-implementing the expression
+    language is the retype-the-normative-thing mistake this suite exists to
+    catch.
+    """
+    lines = workflow_lines(workflow)
+    start = step_indent = None
+    for index, line in enumerate(lines):
+        if line.strip() == f"- name: {step_name}":
+            start, step_indent = index, _indent_of(line)
+    assert start is not None, f"no step named {step_name!r} in {workflow.name}"
+    key_indent = step_indent + 2
+    collected = None
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if line.strip() and _indent_of(line) <= step_indent:
+            break
+        indent = _indent_of(line)
+        if indent == key_indent and line.strip().startswith(f"{field}:"):
+            collected = [line.strip()[len(field) + 1:].strip()]
+            continue
+        if collected is not None:
+            if line.strip().startswith("#"):
+                continue
+            if not line.strip() or indent <= key_indent:
+                break
+            collected.append(line.strip())
+    assert collected is not None, f"step {step_name!r} has no `{field}:`"
+    return " ".join(part for part in collected if part not in ("", ">-", ">", "|"))
+
+
+def parse_github_output(path: Path):
+    """`$GITHUB_OUTPUT` as a dict. Values may contain `=`; keys may not."""
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    outputs = {}
+    for line in text.splitlines():
+        if not line:
+            continue
+        key, sep, value = line.partition("=")
+        assert sep, f"malformed GITHUB_OUTPUT line: {line!r}"
+        outputs[key] = value
+    return outputs
+
+
+class StepResult:
+    """Everything a workflow step communicates: exit code, logs, outputs, summary."""
+
+    def __init__(self, proc, outputs, summary):
+        self.proc, self.outputs, self.summary = proc, outputs, summary
+        self.returncode = proc.returncode
+        self.stdout = proc.stdout.decode("utf-8", "replace")
+        self.stderr = proc.stderr.decode("utf-8", "replace")
+
+    @property
+    def log(self):
+        """Workflow log commands (`::error::`, `::notice::`) land on stdout."""
+        return self.stdout + self.stderr
+
+    def __repr__(self):  # pragma: no cover - only rendered on failure
+        return (f"StepResult(rc={self.returncode}, outputs={self.outputs!r}, "
+                f"log={self.log!r}, summary={self.summary!r})")
+
+
+def run_workflow_step(script, *, runner_temp, env=None, cwd=None, timeout=120):
+    """Execute an extracted step body the way a runner does: bash, env, files."""
+    runner_temp.mkdir(parents=True, exist_ok=True)
+    output_path = runner_temp / "github_output"
+    summary_path = runner_temp / "github_step_summary"
+    output_path.write_text("", encoding="utf-8")
+    summary_path.write_text("", encoding="utf-8")
+    full_env = dict(os.environ)
+    full_env.update({
+        "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_OUTPUT": str(output_path),
+        "GITHUB_STEP_SUMMARY": str(summary_path),
+        "MAPPING": str(MAPPING_PATH),
+        "TOOLCHAIN": str(TOOLCHAIN_PATH),
+    })
+    full_env.update(env or {})
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        env=full_env,
+        cwd=str(cwd or REPO_ROOT),
+        timeout=timeout,
+    )
+    return StepResult(proc, parse_github_output(output_path),
+                      summary_path.read_text(encoding="utf-8"))
+
+
+# --- `work` step harness ---------------------------------------------------
+WORK_STEP = "Decide whether there is work"
+WORK_STEP_OUTPUTS = {"moves", "closes", "all_rejected", "state_screen"}
+
+
+def run_work_step(tmp_path, actions, moves_text="", *, mapping=None):
+    """Run the shipped `work` step over an action plan and a ledger batch.
+
+    `actions` is drain.py's out-actions document (a dict) or the raw text of
+    one; `moves_text` is the out-moves file's content.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    blob = actions if isinstance(actions, str) else json.dumps(actions, indent=2)
+    (tmp_path / "actions.json").write_text(blob, encoding="utf-8")
+    (tmp_path / "moves.txt").write_text(moves_text, encoding="utf-8")
+    env = {"MAPPING": str(mapping)} if mapping is not None else None
+    return run_workflow_step(workflow_step_run(WORK_STEP), runner_temp=tmp_path, env=env)
+
+
+def run_drain_then_work_step(tmp_path, issues, ledger_text, *, toolchain=None):
+    """Drive the shipped `work` step with REAL drain.py output.
+
+    The two are a contract: the step reads only fields drain.py writes. Feeding
+    it a hand-built plan tests the step against an imagined producer, so every
+    behavioural scenario goes through the real one and only the deliberately
+    DEFECTIVE plans (which a correct drain cannot emit) are synthetic.
+    """
+    proc, moves_path, actions_path = run_drain(
+        tmp_path / "drain", issues, ledger_text, toolchain=toolchain
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    actions = load_actions(actions_path)
+    moves_text = moves_path.read_text(encoding="ascii")
+    result = run_work_step(tmp_path / "step", actions, moves_text)
+    return actions, moves_text, result
+
+
+# --- SPEC 5.8: section state, the unconditional display witness ------------
+#: Closed set of three in PRECEDENCE order, mirrored in mapping section_states.
+SECTION_SEALED, SECTION_CAPPED, SECTION_OPEN = "sealed", "capped", "open"
+
+#: SPEC 5.8 screen selection is a LOOKUP, not a predicate: the consumer maps a
+#: value it was handed and hard-fails on an unmapped one. Encoded once here so
+#: no test re-derives "what sealed means".
+SCREEN_FOR_SECTION_STATE = {
+    SECTION_SEALED: "SEALED",
+    SECTION_CAPPED: "LOG_FULL",
+    SECTION_OPEN: "",
+}
+
+
+def section_state_of(actions):
+    """SPEC 5.8's field, failing with the whole document when it is absent.
+
+    A bare KeyError would read as a harness bug; the missing field IS the
+    finding, so it is reported as one.
+    """
+    assert "section" in actions, (
+        "SPEC 5.8: the actions JSON carries no top-level `section` member. It is "
+        "unconditional on every exit-0 drain — including an empty, all-duplicate "
+        f"or nothing-admissible batch. Got keys: {sorted(actions)}"
+    )
+    section = actions["section"]
+    assert isinstance(section, dict) and "state" in section, (
+        f"SPEC 5.8: `section` must be an object carrying `state`, got {section!r}"
+    )
+    return section["state"]
+
+
+class _NoReason:
+    """Sentinel: emit a post_push entry with NO `reason` key at all."""
+
+    def __repr__(self):  # pragma: no cover - only rendered on failure
+        return "<no reason field>"
+
+
+#: Distinct from `reason: null` — one omits the key, the other sets it to null.
+#: jq's `join` renders BOTH as the empty string, which is why the enum guard
+#: uses `tojson`; the two cases therefore need separate fixtures.
+NO_REASON_FIELD = _NoReason()
+
+#: drain.py's reason -> action derivation, mirrored so synthetic plans are
+#: well-formed in every dimension EXCEPT the one a given test deforms.
+ACTION_FOR_REASON = {
+    "applied": "close-applied",
+    "duplicate": "close-duplicate",
+    "grammar": "close-reject",
+    "cooldown": "close-reject",
+    "section-cap": "close-reject",
+    "sealed": "close-reject",
+}
+
+
+#: Sentinel: emit an actions document with NO top-level `section` member.
+NO_SECTION_FIELD = object()
+
+
+def close_plan(*entries, section=SECTION_OPEN):
+    """A synthetic post_push plan: `close_plan((1, "sealed"), (2, "grammar"))`.
+
+    Only for plans a correct drain.py CANNOT emit — the defect cases the
+    consumer's guards exist to refuse, and the combinations the drain's own
+    ordering makes unreachable but the consumer defends against anyway.
+    `section` carries the SPEC 5.8 state; pass NO_SECTION_FIELD to omit it.
+    """
+    post_push = []
+    for issue, reason in entries:
+        entry = {"issue": issue, "action": ACTION_FOR_REASON.get(reason, "close-reject"),
+                 "message": None}
+        if reason is not NO_REASON_FIELD:
+            entry["reason"] = reason
+        post_push.append(entry)
+    plan = {"mapping_version": MAPPING_VERSION, "moves": [], "post_push": post_push}
+    if section is not NO_SECTION_FIELD:
+        plan["section"] = {"state": section}
+    return plan
+
+
+def _sortable(code):
+    """Order codes deterministically even when one is absent or non-string."""
+    return (code is None, str(code))
+
+
+def reason_codes_of(actions):
+    """The reason codes in a plan, as a sorted list (missing key -> None)."""
+    return sorted((entry.get("reason") for entry in actions["post_push"]),
+                  key=_sortable)
+
+
+def assert_drain_plan_shape(actions, moves_text, *, reasons, applied, drained,
+                            ledger_lines=None):
+    """Assert a scenario IS the case its name claims, before asserting the verdict.
+
+    Same discipline as assert_fixture_shape(): a scenario named "grammar-only"
+    whose drain actually emitted `cooldown` would assert a different predicate
+    than it advertises, and the step's output would look correct for the wrong
+    reason. Pin the input first, then judge the output.
+    """
+    got = sorted({entry.get("reason") for entry in actions["post_push"]}, key=_sortable)
+    want = sorted(set(reasons), key=_sortable)
+    assert got == want, f"scenario reason codes: got {got}, claimed {want}"
+    got_applied = len([e for e in actions["post_push"] if e.get("reason") == "applied"])
+    assert got_applied == applied, (
+        f"scenario applied closes: got {got_applied}, claimed {applied}"
+    )
+    got_drained = len([e for e in actions["post_push"] if e.get("reason") != "duplicate"])
+    assert got_drained == drained, (
+        f"scenario drained (non-duplicate) closes: got {got_drained}, claimed {drained}"
+    )
+    expected_lines = applied if ledger_lines is None else ledger_lines
+    got_lines = len(moves_text.splitlines())
+    assert got_lines == expected_lines, (
+        f"scenario ledger lines: got {got_lines}, claimed {expected_lines}"
+    )
+
+
+# --- `encode` step harness -------------------------------------------------
+ENCODE_STEP = "Encode the GIF through the budget ladder"
+
+#: A stand-in for the pinned ffmpeg. It copies a prepared artifact into the
+#: output path the step names, so the REAL budget.py renders the REAL verdict
+#: over a REAL file and the shipped shell does the REAL branching. Only the
+#: encoder — the one component a unit test cannot run — is replaced.
+FFMPEG_STUB = '''#!/usr/bin/env python3
+"""Deterministic ffmpeg stand-in driven by DOOM_STUB_ARTIFACTS (JSON list).
+
+Rung N of the ladder gets artifact N; the last entry repeats for any further
+rung, so a one-element list means "every rung produces this". The literal
+"NONE" means "exit 0 without writing an output file".
+"""
+import json, os, pathlib, shutil, sys
+
+sys.stdin.buffer.read()  # drain the pipe: `tail -c ... | ffmpeg` under
+                         # `set -o pipefail` fails the step on SIGPIPE
+counter = pathlib.Path(os.environ["DOOM_STUB_COUNTER"])
+call = int(counter.read_text()) if counter.exists() else 0
+counter.write_text(str(call + 1))
+artifacts = json.loads(os.environ["DOOM_STUB_ARTIFACTS"])
+source = artifacts[min(call, len(artifacts) - 1)]
+if source != "NONE":
+    shutil.copyfile(source, sys.argv[-1])
+'''
+
+NO_ARTIFACT = "NONE"
+
+
+def run_encode_step(tmp_path, artifacts, *, cwd=None, capture_bytes=4096):
+    """Run the shipped encode step with a stubbed encoder and the real gate.
+
+    `artifacts` is a list of on-disk paths (or NO_ARTIFACT) — one per ladder
+    rung, last entry repeating.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "capture.raw").write_bytes(b"\0" * capture_bytes)
+    stub = tmp_path / "ffmpeg_stub.py"
+    stub.write_text(FFMPEG_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+    env = {
+        "FFMPEG_BIN": str(stub),
+        "FPS": "12",
+        "WIDTH": "320",
+        "HEIGHT": "200",
+        "FRAME_BYTES": str(320 * 200 * 4),
+        "DOOM_STUB_ARTIFACTS": json.dumps([str(a) for a in artifacts]),
+        "DOOM_STUB_COUNTER": str(tmp_path / "stub_calls"),
+    }
+    return run_workflow_step(workflow_step_run(ENCODE_STEP),
+                             runner_temp=tmp_path, env=env, cwd=cwd)
+
+
+def stub_budget_sandbox(tmp_path, exit_code, stdout="{}"):
+    """A cwd whose `game/scripts/budget.py` exits with an arbitrary code.
+
+    The step invokes the gate by RELATIVE path, so a sandboxed cwd is how an
+    exit outside budget.py's documented taxonomy can be exercised without
+    touching the real gate (which owns that taxonomy and must not be edited to
+    make a workflow test pass).
+    """
+    scripts = tmp_path / "game" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "budget.py").write_text(
+        "import sys\n"
+        f"sys.stdout.write({stdout!r})\n"
+        f"sys.exit({int(exit_code)})\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+# --- Summarize step harness ------------------------------------------------
+SUMMARIZE_STEP = "Summarize"
+STATE_SWAP_STEP = "Swap in the SEALED or LOG_FULL guidance screen"
+
+
+def run_summarize_step(tmp_path, **env):
+    """Run the shipped Summarize step. Every input arrives through env, which
+    is the workflow's own uniform rule (no `${{ }}` inside any run block)."""
+    defaults = {
+        "GITHUB_EVENT_NAME": "issues",
+        "DRY_RUN": "false",
+        "MOVES": "n/a",
+        "CLOSES": "n/a",
+        "RUNG": "n/a",
+        "PIN_MISMATCH": "false",
+        "ALL_REJECTED": "false",
+        "STATE_SCREEN": "none",
+        "BUDGET_FAILURE": "none",
+        "SWAP_OUTCOME": "skipped",
+    }
+    defaults.update({key: str(value) for key, value in env.items()})
+    return run_workflow_step(workflow_step_run(SUMMARIZE_STEP),
+                             runner_temp=tmp_path, env=defaults)
