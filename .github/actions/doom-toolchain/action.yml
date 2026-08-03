@@ -164,8 +164,10 @@ runs:
         }
 
         if [ "${ENGINE_PIN_STATUS}" = "canonical" ] && verify "$bin"; then
+          engine_origin='restored-from-cache'
           echo "engine restored from cache and verified against the recorded SHA-256"
         else
+          engine_origin='built-from-source'
           if [ "${ENGINE_PIN_STATUS}" != "canonical" ]; then
             echo "::notice::engine build hash is '${ENGINE_PIN_STATUS}' - building from pinned source and reporting the computed hash (plan D9 capture)"
           else
@@ -199,6 +201,20 @@ runs:
         built="$(sha256sum "$bin" | cut -d' ' -f1)"
         echo "bin=${bin}" >> "$GITHUB_OUTPUT"
         echo "build-sha256=${built}" >> "$GITHUB_OUTPUT"
+        # Also to stdout, on one greppable line. The step summary below is the
+        # human-readable form, but $GITHUB_STEP_SUMMARY is not exposed by ANY
+        # REST endpoint (`check-runs/{id}.output.summary` is null for Actions
+        # jobs), so a value written only there cannot be read back off a
+        # finished run. This job is the plan D9 capture mechanism for the
+        # canonical ubuntu-24.04 build hash, which makes machine-retrievability
+        # a requirement, not a convenience: the capture must be auditable from
+        # the run log long after the run, not transcribed by eye at the time.
+        # ImageOS/ImageVersion are set by GitHub-hosted runners only, so the
+        # line doubles as provenance: it proves the hash came off a real hosted
+        # ubuntu-24.04 image and, via origin=, whether it was compiled here or
+        # replayed out of the cache. Defaulted so `set -u` cannot trip on a
+        # self-hosted or act runner.
+        echo "doom-toolchain: engine-build-sha256=${built} pin-status=${ENGINE_PIN_STATUS} origin=${engine_origin} runner-image=${ImageOS:-unknown}/${ImageVersion:-unknown}"
         {
           echo "### DOOM engine"
           echo ""
@@ -207,6 +223,8 @@ runs:
           echo "| pinned commit | \`${ENGINE_SHA}\` |"
           echo "| recorded build SHA-256 | \`${ENGINE_BUILD_SHA256}\` (${ENGINE_PIN_STATUS}) |"
           echo "| built SHA-256 (this run) | \`${built}\` |"
+          echo "| binary origin | ${engine_origin} |"
+          echo "| runner image | \`${ImageOS:-unknown}/${ImageVersion:-unknown}\` |"
         } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Save pinned engine build
