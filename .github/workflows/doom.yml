@@ -170,6 +170,17 @@ jobs:
       # switched on last, in one reviewable commit, at E9 stage 2. Every
       # render in this workflow honours it, so the committed block and the
       # rendered block can never disagree about whether controls are live.
+      #
+      # The six render sites build their argument array as
+      #   controls=(--controls-enabled --repository "${GITHUB_REPOSITORY}")
+      # and SPEC 9.1 makes the pairing structural, not stylistic: the target is
+      # required if and only if the table is rendered, it has no default and no
+      # fallback, and it may never be a literal. The value comes from the
+      # execution environment because only the repository whose own workflow
+      # will drain the issue has the property every rendered link needs. A
+      # render site that grows `--controls-enabled` without the target exits 2
+      # before the README is opened - a missed site fails loudly instead of
+      # quietly publishing links that point somewhere else.
       CONTROLS_ENABLED: 'false'
       # Relative repo paths, matching what E6 committed and the convention
       # of the profile's existing octocat.gif. State screens are static
@@ -297,7 +308,7 @@ jobs:
         run: |
           set -euo pipefail
           controls=()
-          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled --repository "${GITHUB_REPOSITORY}"); fi
           python3 game/scripts/rewrite_readme.py --readme README.md --mapping "${MAPPING}" \
             --state PAUSED "${controls[@]}" \
             --image-url "${SCREEN_PAUSED}"
@@ -889,7 +900,7 @@ jobs:
         run: |
           set -euo pipefail
           controls=()
-          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled --repository "${GITHUB_REPOSITORY}"); fi
           # Validates the marker pair before touching a byte and writes only
           # between the markers, atomically and idempotently (must_have 8).
           # Exit 6 = marker validation failed: the file is untouched and the
@@ -924,7 +935,7 @@ jobs:
         run: |
           set -euo pipefail
           controls=()
-          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled --repository "${GITHUB_REPOSITORY}"); fi
           attempts="$(jq -r '.knobs.push_retry_attempts' "${MAPPING}")"
           moves="$(wc -l < "${RUNNER_TEMP}/moves.txt" | tr -d ' ')"
           pushed=false
@@ -1049,7 +1060,7 @@ jobs:
         run: |
           set -euo pipefail
           controls=()
-          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled --repository "${GITHUB_REPOSITORY}"); fi
 
           # The `if:` above is a prefilter only - Actions expression comparison
           # folds case, so this case statement is the authoritative match.
@@ -1158,7 +1169,7 @@ jobs:
         run: |
           set -euo pipefail
           controls=()
-          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled --repository "${GITHUB_REPOSITORY}"); fi
           # Pushed well before the 60-day scheduled-workflow auto-disable, so
           # the profile shows an honest idle state instead of a stale frame.
           python3 game/scripts/rewrite_readme.py --readme README.md --mapping "${MAPPING}" \
@@ -1203,7 +1214,7 @@ jobs:
         run: |
           set -euo pipefail
           controls=()
-          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled --repository "${GITHUB_REPOSITORY}"); fi
           # Display-only: reset to the origin tip first so the un-pushed ledger
           # and stream cannot ride along. Game state is never written by a
           # failed run.
