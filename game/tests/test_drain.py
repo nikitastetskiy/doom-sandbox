@@ -69,11 +69,16 @@
       Consumers select the §11 guidance screen by LOOKUP (sealed -> SEALED,
       capped -> LOG_FULL, open -> none) and hard-fail on an unmapped value;
       no consumer re-derives the pin comparison or the cap comparison (SPEC 0.5)
-    - SEALED MODE (SPEC 5.5, ratified in 5e2c68f). NEW REQUIRED ARGUMENT
-      --toolchain PATH: sealing is computed at run time by comparing the
-      CURRENT section's header against game/toolchain.json
-      (engine.commit_sha, engine.build_sha256.value, wad.sha256) and the
-      mapping file's mapping_version. Any disagreement seals the section.
+    - SEALED MODE (SPEC 5.5, ratified in 5e2c68f; pins amended by SPEC 5.9 in
+      16184f9). NEW REQUIRED ARGUMENT --toolchain PATH: sealing is computed at
+      run time by comparing the CURRENT section's header against the mapping's
+      `sealing_pins` — engine.commit_sha and wad.sha256 from
+      game/toolchain.json, plus the mapping file's mapping_version. Any
+      disagreement seals the section. `build` is NOT among them: it is a
+      property of the runner image, which rotates on a schedule nobody here
+      controls, and the golden fixture shows two binaries of the same pinned
+      commit replaying identically. It stays in the header as provenance and
+      is never a comparand (SPEC 5.9; game/tests/test_sealing_predicate.py)
       * while sealed, the ONLY admissible move is `doom: new game`; every
         other otherwise-valid move is close-rejected with the verbatim
         message "the arcade is being upgraded — press New game to continue"
@@ -700,14 +705,37 @@ def test_cooldown_still_applies_when_the_section_is_not_sealed(tmp_path):
     assert post_push_by_issue(load_actions(actions_path))[30]["reason"] == REASON_COOLDOWN
 
 
-@pytest.mark.parametrize(
-    ("pin", "override"),
-    [("engine", {"engine": "99" * 20}), ("build", {"build": "88" * 32}),
-     ("wad", {"wad": "77" * 32})],
-    ids=["engine-commit-sha", "engine-build-sha256", "wad-sha256"],
-)
-def test_any_disagreeing_pin_seals_the_section(tmp_path, pin, override):
-    toolchain = make_toolchain(tmp_path, **override)
+# SPEC 5.9: driven from the mapping, never hand-listed. `build` sat in this
+# table until 16184f9 and is now provenance — a hand-written pin set is exactly
+# how the pre-amendment contract survived the amendment that removed it.
+SEALING_PINS = load_mapping()["sealing_pins"]
+TOOLCHAIN_PIN_OVERRIDES = {
+    "engine": {"engine": "99" * 20},
+    "wad": {"wad": "77" * 32},
+}
+#: `mapping` is a sealing pin whose comparand is the mapping FILE's
+#: mapping_version rather than a game/toolchain.json field, so it is exercised
+#: by test_mapping_version_disagreement_seals_the_section below.
+PINS_EXERCISED_ELSEWHERE = {"mapping"}
+
+
+def test_every_sealing_pin_is_exercised_by_a_test_in_this_file():
+    """Bidirectional, so neither direction of drift can pass silently.
+
+    A pin added to the mapping with no test here fails; a pin this file still
+    claims after the mapping drops it also fails. The second direction is the
+    one that went unnoticed through SPEC 5.9.
+    """
+    covered = set(TOOLCHAIN_PIN_OVERRIDES) | PINS_EXERCISED_ELSEWHERE
+    assert set(SEALING_PINS) == covered, (
+        f"mapping sealing_pins={SEALING_PINS}, exercised here={sorted(covered)}"
+    )
+
+
+@pytest.mark.parametrize("pin", sorted(TOOLCHAIN_PIN_OVERRIDES))
+def test_any_disagreeing_sealing_pin_seals_the_section(tmp_path, pin):
+    assert pin in SEALING_PINS, f"{pin} is no longer a SPEC 5.9 sealing pin"
+    toolchain = make_toolchain(tmp_path, **TOOLCHAIN_PIN_OVERRIDES[pin])
     issues = [make_issue(19, "doom: fire", TS, login="player")]
     proc, moves_path, actions_path = run_drain(
         tmp_path, issues, EMPTY_LEDGER, toolchain=toolchain
@@ -715,6 +743,29 @@ def test_any_disagreeing_pin_seals_the_section(tmp_path, pin, override):
     assert proc.returncode == 0
     assert moves_path.read_bytes() == b""
     assert post_push_by_issue(load_actions(actions_path))[19]["reason"] == REASON_SEALED
+
+
+def test_a_disagreeing_build_hash_does_not_seal_the_section(tmp_path):
+    """SPEC 5.9, on the same fixture the removed `build` case used.
+
+    The binary's bytes are a property of the runner image version; the replay
+    is the property that matters, and it reproduced byte-exact across two
+    architectures and two clangs. Sealing here would answer an infrastructure
+    event by demanding a `new game` — discarding a live session to repair
+    nothing.
+    """
+    assert "build" not in SEALING_PINS, SEALING_PINS
+    toolchain = make_toolchain(tmp_path, build="88" * 32)
+    issues = [make_issue(19, "doom: fire", TS, login="player")]
+    proc, moves_path, actions_path = run_drain(
+        tmp_path, issues, EMPTY_LEDGER, toolchain=toolchain
+    )
+    assert proc.returncode == 0
+    assert moves_path.read_text(encoding="ascii").endswith("fire 1 #19\n"), (
+        "the move must be admitted, not sealed-rejected"
+    )
+    assert post_push_by_issue(load_actions(actions_path))[19]["reason"] == REASON_APPLIED
+    assert load_actions(actions_path)["section"]["state"] == "open"
 
 
 def test_mapping_version_disagreement_seals_the_section(tmp_path):

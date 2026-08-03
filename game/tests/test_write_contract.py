@@ -42,6 +42,7 @@ from conftest import (
     outside_parts_bytes,
     run_budget,
     run_drain,
+    TEST_REPOSITORY,
     run_rewriter,
     run_script,
     sparse_file,
@@ -104,7 +105,11 @@ def compose_run(ws, issues_dir, issues, *, gif_size, fail_state_push=False, fail
             return "pre-push-failure"
 
     # marker-validated LIVE rewrite before any push
-    rewrite = run_rewriter(ws.readme, state="LIVE", image_url=GIF_URL, controls_enabled=True)
+    # SPEC 9.1: the control-link target is supplied at render time. This
+    # simulation renders the control table, so it must name one — the same
+    # obligation doom.yml has, from GITHUB_REPOSITORY.
+    rewrite = run_rewriter(ws.readme, state="LIVE", image_url=GIF_URL,
+                           controls_enabled=True, repository=TEST_REPOSITORY)
     if rewrite.returncode == 6:
         return "marker-validation-failure"  # swap suppressed: nothing else runs
     assert rewrite.returncode == 0, (rewrite.stdout, rewrite.stderr)

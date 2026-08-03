@@ -34,11 +34,19 @@
       successful run, satisfying the RFC-normative
       `stream == expand(ledger, mapping_version)` CI invariant. An entry-less
       current section yields exactly b"\\n" (zero frames, no commas, one LF)
-    - SEALED SECTIONS (SPEC §5.5, normative — ratified in 5e2c68f). A section
-      is SEALED when any header field (engine/build/wad/mapping) disagrees with
-      the running toolchain (--toolchain plus --engine-build-sha256, and the
-      mapping file's mapping_version). Sealing is computed at run time and is
-      never stored. Then:
+    - SEALED SECTIONS (SPEC §5.5, normative — ratified in 5e2c68f; pins amended
+      by SPEC §5.9 in 16184f9). A section is SEALED when any of the mapping's
+      `sealing_pins` in the header disagrees with the running toolchain —
+      engine and wad from --toolchain, plus the mapping file's mapping_version.
+      Sealing is computed at run time and is never stored.
+      `--engine-build-sha256` is WRITE-ONLY: it is stamped into a new section
+      header at rollover as provenance and is NEVER a comparand. The binary's
+      bytes are a property of the runner image, which rotates on a schedule
+      nobody here controls, while the golden fixture replays byte-exact across
+      two architectures — two binaries, one replay. The predicate itself lives
+      in gamelog.py and is called from here and from drain.py; holding a second
+      copy that read a DIFFERENT comparand is what produced SPEC §5.9's
+      livelock (one sealed-on-arrival section per reset, forever). Then:
       * rule 1 — a sealed section never advances and is never re-simulated: no
         frame-contributing line may be appended to it, and --stream is NOT
         regenerated while sealed (leave the file byte-untouched, even if the
@@ -81,6 +89,7 @@ from conftest import (
     make_toolchain,
     import_gamelog,
     ledger_line,
+    load_mapping,
     make_section_text,
     run_script,
     section_header,
@@ -333,25 +342,59 @@ def test_stale_stream_is_overwritten_not_appended(tmp_path):
 
 # --- Pin guard: refuse to run rather than fork the timeline -------------------------
 
-PIN_MISMATCHES = [
-    ("engine-commit-sha", {"engine": "99" * 20}),
-    ("engine-build-sha256", {"build_arg": "88" * 32}),
-    ("wad-sha256", {"wad": "77" * 32}),
-]
+# SPEC 5.9: driven from the mapping, never hand-listed. `engine-build-sha256`
+# sat in this table until 16184f9 and is now provenance — the same stale entry
+# that survived in test_drain.py, for the same reason: a hand-written pin set
+# outlives the amendment that removes one of its members.
+SEALING_PINS = load_mapping()["sealing_pins"]
+PIN_MISMATCHES = {
+    "engine": {"engine": "99" * 20},
+    "wad": {"wad": "77" * 32},
+}
+#: `mapping` is a sealing pin compared against the mapping FILE's
+#: mapping_version, exercised by
+#: test_mapping_version_mismatch_in_the_header_refuses_with_exit_7 below.
+PINS_EXERCISED_ELSEWHERE = {"mapping"}
 
 
-@pytest.mark.parametrize(
-    ("kwargs",), [(k,) for _, k in PIN_MISMATCHES], ids=[i for i, _ in PIN_MISMATCHES]
-)
-def test_pin_mismatch_refuses_with_exit_7(tmp_path, kwargs):
+def test_every_sealing_pin_is_exercised_by_a_test_in_this_file():
+    """Bidirectional drift guard — see the twin in test_drain.py."""
+    covered = set(PIN_MISMATCHES) | PINS_EXERCISED_ELSEWHERE
+    assert set(SEALING_PINS) == covered, (
+        f"mapping sealing_pins={SEALING_PINS}, exercised here={sorted(covered)}"
+    )
+
+
+@pytest.mark.parametrize("pin", sorted(PIN_MISMATCHES))
+def test_sealing_pin_mismatch_refuses_with_exit_7(tmp_path, pin):
+    assert pin in SEALING_PINS, f"{pin} is no longer a SPEC 5.9 sealing pin"
     before = one_section([ledger_line("2026-08-02T09:00:00Z", "carol", "fire", 1, 5)])
     proc, ledger, stream = run_apply(
         tmp_path, before, ledger_line(TS, "alice", "forward", 1, 11) + "\n",
-        stream_text="f,f\n", **kwargs
+        stream_text="f,f\n", **PIN_MISMATCHES[pin]
     )
     assert proc.returncode == 7, (proc.stdout, proc.stderr)
     assert ledger.read_text(encoding="ascii") == before, "refusal must not append"
     assert stream.read_text(encoding="ascii") == "f,f\n", "refusal must not rewrite the stream"
+
+
+def test_a_build_hash_mismatch_does_not_refuse(tmp_path):
+    """SPEC 5.9, on the same fixture the removed `engine-build-sha256` case used.
+
+    Exit 7 is SPEC 5.5 rule 4's defense in depth. Firing it on a runner-image
+    rotation is a refusal to advance a section nothing is wrong with, and it is
+    the half of the livelock that lives on this side: with `build` compared
+    here and not in the drain, the drain admits a reset and this script opens
+    the next section already doomed to seal on arrival.
+    """
+    assert "build" not in SEALING_PINS, SEALING_PINS
+    before = one_section([ledger_line("2026-08-02T09:00:00Z", "carol", "fire", 1, 5)])
+    proc, ledger, _ = run_apply(
+        tmp_path, before, ledger_line(TS, "alice", "forward", 1, 11) + "\n",
+        stream_text="f,f\n", build_arg="88" * 32,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "forward 1 #11" in ledger.read_text(encoding="ascii")
 
 
 def test_mapping_version_mismatch_in_the_header_refuses_with_exit_7(tmp_path):
