@@ -105,6 +105,7 @@
   },
   "reason_codes": ["applied", "duplicate", "grammar", "cooldown", "section-cap", "sealed"],
   "section_states": ["sealed", "capped", "open"],
+  "sealing_pins": ["engine", "wad", "mapping"],
   "budget": {
     "ceiling_bytes": 4000000,
     "floor_bytes": 16000,
