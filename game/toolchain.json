@@ -23,13 +23,26 @@
       "ld": "GNU ld (GNU Binutils for Ubuntu) 2.42",
       "make": "GNU Make 4.3",
       "libc6": "2.39-0ubuntu8.8",
-      "note": "CC and LDFLAGS change the resulting binary, so the compiler identity is part of the pin: a build SHA-256 without the toolchain that produced it under-specifies the build. If the ubuntu-24.04 runner's default `clang` is not 18.1.3 the hash below will differ - that is the reconciliation E7 task 1 must perform."
+      "note": "CC and LDFLAGS change the resulting binary, so the compiler identity is part of the pin: a build SHA-256 without the toolchain that produced it under-specifies the build. This block describes the DOCKER reference environment, not the runner - see reconciliation below."
+    },
+    "runner_image_sensitivity": {
+      "finding": "The Docker reference build and the real ubuntu-24.04 runner build DISAGREE, and the ubuntu-24.04 runner image published a clang 18.1.3 identical in major.minor.patch to the Docker one. Docker produced 8ca27a6a03d4c37494ad56275ca54271c4942f7f112d42facc9332d445d1290c; the hosted runner produced af458ac9c87a1fc22a529e6dba89089a9a7446c4c86948ea25fd6de534acbfb6.",
+      "reconciliation": "E7 task 1 (2026-08-03) performed the reconciliation build_toolchain_linux.note called for. Outcome: the provisional Docker hash did NOT reproduce on the runner. The differing element was NOT isolated - the runner's compiler was never probed at runtime, only the published image manifest was read - so the honest conclusion is that at least one of {clang package revision, binutils patch revision (image ships 2.42-4ubuntu2.10 vs Docker's 2.42), libc, linked package set} differs. Matching `clang --version` is therefore NOT sufficient to predict this hash.",
+      "runner_image": "ubuntu24/20260720.247.2",
+      "manifest": "https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md",
+      "manifest_clang": "16.0.6, 17.0.6, 18.1.3 (unversioned `clang` default not probed at runtime)",
+      "manifest_binutils": "2.42-4ubuntu2.10",
+      "consequence": "build_sha256 is a property of the RUNNER IMAGE VERSION, not of the pinned engine commit plus a compiler version string. GitHub rotates the ubuntu-24.04 image regularly, so this pin should be expected to break on an image rotation rather than only on a deliberate engine bump. What that costs is a failure-class question, not a pinning one: see the E7 task 1 report - the composite action's canonical-mismatch branch exits 1 (hard job failure) while SPEC 5.5 sealing compares two COMMITTED files (section header vs this file) and so never observes the rebuilt binary at all. Escalated rather than changed here: altering the failure class is a SPEC decision, not a toolchain-pin edit."
     },
     "build_sha256": {
-      "value": "40588a1662efc8e1634d067835d9cadd2de12fa5cb3e3d7e3238ada4a6d02eff",
-      "status": "provisional_local",
-      "platform": "macos-arm64 (apple clang)",
-      "note": "canonical ubuntu-24.04 build SHA-256 is captured in E7 task 1 (plan D9) in one authorized update"
+      "value": "af458ac9c87a1fc22a529e6dba89089a9a7446c4c86948ea25fd6de534acbfb6",
+      "status": "canonical",
+      "platform": "linux-amd64, GitHub-hosted ubuntu-24.04 runner, image ubuntu24/20260720.247.2",
+      "captured": "2026-08-03 - plan D9, step E7 task 1, from the ci.yml golden-frame job in the rehearsal sandbox nikitastetskiy/doom-sandbox",
+      "capture_run_url": "https://github.com/nikitastetskiy/doom-sandbox/actions/runs/30828259814",
+      "capture_evidence": "the run logged `doom-toolchain: engine-build-sha256=af458ac9... pin-status=provisional_local origin=built-from-source runner-image=ubuntu24/20260720.247.2`. origin=built-from-source proves the binary was COMPILED in that job rather than restored from actions/cache - and independently, no engine cache could have existed, because the cache-save step is skipped while the pin is non-canonical, which it still was on the capturing run. runner-image is read from ImageOS/ImageVersion, which only GitHub-hosted runners set, and its value matches the image release the job's own setup block reported. The hash is therefore from a real hosted ubuntu-24.04 runner, not a local or emulated build.",
+      "supersedes": "40588a1662efc8e1634d067835d9cadd2de12fa5cb3e3d7e3238ada4a6d02eff (provisional_local, macos-arm64 apple clang) - retained here because the golden fixture in game/tests/fixtures/golden.expected.json was measured on THAT build, and its framebuffer checksums then reproduced byte-exact under this one",
+      "note": "Canonical. Two consequences the moment this field says 'canonical': .github/actions/doom-toolchain stops bypassing the engine cache, and a rebuild that does not match this value fails the job closed ('determinism pin broken'). See runner_image_sensitivity below - this hash is a property of the runner IMAGE, not just of the pinned commit and clang version."
     },
     "build_sha256_linux": {
       "value": "8ca27a6a03d4c37494ad56275ca54271c4942f7f112d42facc9332d445d1290c",
@@ -38,7 +51,8 @@
       "determinism": "PASS - two builds from the pinned commit in two different source paths (/w1, /w2) inside one ubuntu:24.04 container produced byte-identical binaries. Same double-run + SHA-256 byte-agreement shape used for the E2 replay proof.",
       "runtime_verified": "2026-08-02 - the Linux binary replayed bootstrap_stream + expand(4-move ledger) to exit 0 and a 35,840,000-byte capture whose final frame is in-level gameplay (frame grab inspected, full HUD).",
       "cross_platform_frame_agreement": "the ENTIRE 35-frame / 35,840,000-byte capture is byte-identical to the one produced by the macos-arm64 build from the same input (final-frame SHA-256 38ee759839b22cb0402a6c9c10d3916825ad6ec487c48f3cff5a635d1ab8ec48 on both). This is direct evidence for plan D9's assumption that the framebuffer agrees cross-platform (fixed-point DOOM math) - the BINARY hash is platform-specific, the RENDERED FRAMES are not.",
-      "note": "PROVISIONAL, not canonical. Produced in Docker on ubuntu:24.04 linux/amd64 under qemu emulation on an arm64 host - not on a real GitHub ubuntu-24.04 runner, whose default clang may differ from 18.1.3. E7 task 1 owns the canonical capture (plan D9) and promotes the confirmed value into build_sha256; this field is the reproducible reference to reconcile against, and must not be read as pre-empting it. Nothing in CI reads this field: .github/actions/doom-toolchain still reads .engine.build_sha256.value/.status, which remain untouched."
+      "cross_platform_frame_agreement_confirmed_on_runner": "2026-08-03, E7 task 1: CONFIRMED on the real hosted ubuntu-24.04 runner, and it is the reason the D9 capture changed only one number. game/tests/fixtures/golden.expected.json carries framebuffer checksums measured on macos-arm64; the golden-frame job replayed the fixture on the runner's af458ac9 binary and those checksums matched byte-exact over the full 716,800,000-byte recorded stream. So the three provisional builds (macos-arm64, qemu-Docker, hosted runner) produce three DIFFERENT binaries that render IDENTICAL frames - binary hash platform-specific, rendered frames not, now demonstrated on all three.",
+      "note": "PROVISIONAL and now SUPERSEDED - retained as the reconciliation record, not as a pin. Produced in Docker on ubuntu:24.04 linux/amd64 under qemu emulation on an arm64 host, not on a real GitHub ubuntu-24.04 runner. E7 task 1 performed the capture on 2026-08-03 and the runner produced a DIFFERENT hash (af458ac9..., now in build_sha256). The caveat this field was written under therefore held: a qemu-Docker build is not a substitute for the runner, and the reason was not a clang major-version difference. See runner_image_sensitivity. Nothing in CI reads this field: .github/actions/doom-toolchain reads .engine.build_sha256.value/.status."
     }
   },
   "wad": {

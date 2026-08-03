@@ -1,8 +1,18 @@
 {
   "fixture": "game/tests/fixtures/golden.stream",
   "fixture_sha256": "8c6b095e33f054b813f3f7d7519a8ecac0f2f7964ced2c9eb53be7f43c70548e",
-  "status": "provisional_local",
-  "status_note": "values measured on the macos-arm64 local engine build; the canonical ubuntu-24.04 values are captured in E7 task 1 (plan D9) in one authorized, documented update, then this file re-verifies green",
+  "status": "canonical",
+  "status_note": "Measured on the macos-arm64 local engine build, then CONFIRMED unchanged on a real hosted ubuntu-24.04 runner by E7 task 1 (plan D9) on 2026-08-03. No value in this file moved: the ubuntu-24.04 replay reproduced every checksum below byte-exact, so the capture promoted the status and changed no measurement. The engine BINARY hash did move (macos-arm64 40588a16... -> ubuntu-24.04 af458ac9..., recorded in game/toolchain.json) - a different binary rendering identical frames, which is what plan D9 assumed and this run demonstrated.",
+  "canonical_capture": {
+    "captured": "2026-08-03, step E7 task 1, plan D9",
+    "runner_image": "ubuntu24/20260720.247.2",
+    "engine_build_sha256": "af458ac9c87a1fc22a529e6dba89089a9a7446c4c86948ea25fd6de534acbfb6",
+    "run_urls": [
+      "https://github.com/nikitastetskiy/doom-sandbox/actions/runs/30827771884",
+      "https://github.com/nikitastetskiy/doom-sandbox/actions/runs/30828259814"
+    ],
+    "evidence": "both runs' golden-frame job reported `1 passed` - executed, NOT skipped. The test skips loudly when DOOM_ENGINE_BIN is absent, so `passed` is the only outcome that proves the 716,800,000-byte replay actually ran and every assertion below was evaluated."
+  },
   "engine_commit_sha": "f37f5bf81daaa2fc9e39b53d6a52eeff80eb299a",
   "wad_sha256": "7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d",
   "invocation": {
@@ -18,7 +28,8 @@
   "replay_agreement": {
     "run1_recorded_stream_sha256": "7cc38611ed92453ab3015dfa2e4a97f43a393010f9eb12f027624234cf014d98",
     "run2_recorded_stream_sha256": "7cc38611ed92453ab3015dfa2e4a97f43a393010f9eb12f027624234cf014d98",
-    "verified": "2026-07-30 - two independent full replays on the local build produced byte-identical 716,800,000-byte recorded streams"
+    "verified": "2026-07-30 - two independent full replays on the local build produced byte-identical 716,800,000-byte recorded streams",
+    "verified_ubuntu_24_04": "2026-08-03 - two further independent replays, on two separate hosted ubuntu-24.04 runner jobs in two separate workflow runs (30827771884 and 30828259814), each rebuilt the engine from the pinned commit and each reproduced recorded_stream_sha256 and final_frame_sha256 exactly. Determinism across independent runs (must_have 2) is therefore observed on the target platform, not inferred from the local build."
   },
   "final_frame_visual": "in-level first-person view with full HUD (ammo 44, health 72%, armor 0%) - verified by frame grab 2026-07-30"
 }
