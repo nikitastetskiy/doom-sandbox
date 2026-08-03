@@ -181,7 +181,7 @@ jobs:
       # render site that grows `--controls-enabled` without the target exits 2
       # before the README is opened - a missed site fails loudly instead of
       # quietly publishing links that point somewhere else.
-      CONTROLS_ENABLED: 'false'
+      CONTROLS_ENABLED: 'true'
       # Relative repo paths, matching what E6 committed and the convention
       # of the profile's existing octocat.gif. State screens are static
       # committed assets, so they need no ?run= buster: a swap changes the
