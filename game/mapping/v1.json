@@ -1,5 +1,5 @@
 {
-  "mapping_version": 2,
+  "mapping_version": 1,
   "engine_fps": 35,
   "repeat": { "min": 2, "max": 9 },
   "tokens": [
