@@ -3,13 +3,27 @@
 @interface budget.py --mapping PATH --rung {L0,L1,L2} (--size BYTES | --file
     PATH); stdout JSON; exit 0 publish / 10 over-ceiling with a next rung /
     11 over-ceiling at L2 = hard fail, no publish / 12 at-or-below-floor hard
-    fail, no publish, NO ladder descent / 2 usage
+    fail, no publish, NO ladder descent / 13 structurally invalid artifact,
+    hard fail, no publish, NO ladder descent / 2 usage
 @behavior
     - Gate order is normative (SPEC 12.1): (1) structural validity — exists,
-      non-empty, GIF89a magic — which MAY live in the workflow or in the
-      script but must precede any size verdict; (2) floor; (3) ceiling/ladder.
-      The floor and ceiling verdicts belong to budget.py, which is what reads
-      the mapping
+      non-empty, GIF89a magic; (2) floor; (3) ceiling/ladder. budget.py
+      enforces step 1 INDEPENDENTLY AND UNCONDITIONALLY before any size
+      verdict — it never assumes the workflow gate ran, on the same
+      defense-in-depth precedent as SPEC 5.5 rule 4. The workflow gate stays
+      too, because it fails faster and logs better; both is the point
+    - Structural failure is exit 13 with reason "structure", deliberately NOT
+      folded into the floor verdict: structural validity is ORTHOGONAL to
+      size. Folding is correct only for the 0-byte case where 0 <= floor_bytes
+      holds by coincidence; a LARGE malformed artifact (truncated GIF, PNG,
+      HTML error page) clears floor and ceiling and would publish. It would
+      also mislabel a 1.5 MB truncated file as a floor violation
+    - Operator meaning of the two hard-fail integers: 13 = the encoder emitted
+      garbage or the wrong file (pipeline/toolchain fault); 12 = the encoder
+      emitted a well-formed but degenerate clip (palette/pix_fmt fault).
+      Different first debugging step, which is why they are separate
+    - A nonexistent --file path stays exit 2: a malformed INVOCATION, not a
+      malformed ARTIFACT
     - Hard ceiling: 4,000,000 bytes exactly (mapping budget.ceiling_bytes);
       size <= ceiling -> exit 0 and {"publish": true, "rung": R, "size": N}
     - Hard floor: 16,000 bytes (mapping budget.floor_bytes). size <= floor ->
@@ -22,7 +36,7 @@
       from the mapping ladder>}; at L1 -> exit 10, next = the L2 entry; at L2 ->
       exit 11, {"publish": false, "hard_fail": true, "next": null,
       "reason": "ceiling"}
-    - Every hard failure carries "reason": "floor" | "ceiling" so the workflow
+    - Every hard failure carries "reason": "structure" | "floor" | "ceiling" so the workflow
       can branch in YAML and an operator can diagnose without reading logs, and
       reports the floor alongside the ceiling in its output
     - Ladder entries (level, tail_seconds, width_px, fps, colors) are read from
@@ -46,6 +60,7 @@ from conftest import (
     BUDGET_FLOOR_BYTES,
     CLIP_18_FRAME_BYTES,
     COLLAPSE_SIGNATURE_BYTES,
+    GIF89A_MAGIC,
     LADDER_LEVELS,
     LADDER_PX_FPS_COLORS,
     STILL_FRAME_BYTES,
@@ -295,14 +310,95 @@ def test_hard_fail_output_reports_the_floor_alongside_the_ceiling(case_id, size,
 
 # --- Degenerate artifacts (the bug that motivated the floor) ----------------------
 
-def test_zero_byte_gif_never_publishes_and_never_descends(tmp_path):
-    """The reported bug: a 0-byte GIF returned publish/exit 0. Whether step 1
-    (structural validity) is enforced in the workflow or in the script, a
-    0-byte artifact must never publish and must never trigger a re-encode."""
+def test_zero_byte_gif_is_a_structural_failure(tmp_path):
+    """The reported bug: a 0-byte GIF returned publish/exit 0. budget.py
+    enforces structure independently and unconditionally (SPEC 12.1 step 1) —
+    it never assumes the workflow gate ran."""
     empty = sparse_file(tmp_path, "empty.gif", 0, magic=b"")
     proc = run_budget("L0", file=empty)
-    assert proc.returncode != 0, "a 0-byte GIF must never publish"
-    assert proc.returncode != 10, "and must never trigger a ladder descent"
+    assert proc.returncode == 13, (proc.stdout, proc.stderr)
+    out = json_stdout(proc)
+    assert out["publish"] is False
+    assert out["hard_fail"] is True
+    assert out["next"] is None
+    assert out["reason"] == "structure"
+
+
+def test_large_malformed_artifact_is_a_structural_failure_not_a_publish(tmp_path):
+    """THE case that motivated exit 13 (SPEC 12.1).
+
+    Structural validity is orthogonal to size. Folding structure into the floor
+    verdict is correct only for the 0-byte case, where 0 <= floor_bytes holds
+    by coincidence. A LARGE malformed artifact — a truncated GIF, a PNG, an
+    HTML error page saved as .gif — clears the floor AND the ceiling and would
+    publish, reopening the exact hole this gate exists to close, one layer
+    down.
+    """
+    bogus = sparse_file(tmp_path, "not-a.gif", 1_500_000, magic=b"")
+    assert BUDGET_FLOOR_BYTES < 1_500_000 < BUDGET_CEILING_BYTES, (
+        "the fixture must sit comfortably inside the publishable size band, "
+        "so only the structural gate can reject it"
+    )
+    proc = run_budget("L0", file=bogus)
+    assert proc.returncode == 13, (
+        f"a 1.5 MB non-GIF must fail structurally, not publish: {proc.stdout!r}"
+    )
+    out = json_stdout(proc)
+    assert out["publish"] is False
+    assert out["reason"] == "structure", (
+        "and must not be mislabelled 'floor' — it is nowhere near the floor"
+    )
+    assert out["next"] is None, "no ladder descent repairs a malformed file"
+
+
+def test_html_error_page_saved_as_gif_is_rejected(tmp_path):
+    """A failed fetch that wrote an error page to the artifact path."""
+    path = tmp_path / "error.gif"
+    path.write_bytes(b"<!DOCTYPE html>\n<html><body>504 Gateway Timeout</body></html>\n"
+                     + b"\0" * 100_000)
+    proc = run_budget("L0", file=path)
+    assert proc.returncode == 13
+    assert json_stdout(proc)["reason"] == "structure"
+
+
+@pytest.mark.parametrize("rung", LADDER_LEVELS)
+def test_structural_failure_never_descends_the_ladder(rung, tmp_path):
+    bogus = sparse_file(tmp_path, f"bogus-{rung}.gif", 1_500_000, magic=b"")
+    proc = run_budget(rung, file=bogus)
+    assert proc.returncode == 13, f"{rung} must hard-fail structurally"
+    assert json_stdout(proc)["next"] is None
+
+
+def test_the_three_hard_fail_reasons_are_distinct(tmp_path):
+    """13 = the encoder emitted garbage or the wrong file (pipeline/toolchain
+    fault); 12 = a well-formed but degenerate clip (palette/pix_fmt fault);
+    11 = genuinely oversized. Different first debugging step, so the operator
+    must be able to tell them apart from the verdict alone."""
+    structure = run_budget("L0", file=sparse_file(tmp_path, "s.gif", 1_500_000, magic=b""))
+    floor = run_budget("L2", size=BUDGET_FLOOR_BYTES)
+    ceiling = run_budget("L2", size=BUDGET_CEILING_BYTES + 1)
+    codes = (structure.returncode, floor.returncode, ceiling.returncode)
+    assert codes == (13, 12, 11)
+    reasons = tuple(json_stdout(p)["reason"] for p in (structure, floor, ceiling))
+    assert reasons == ("structure", "floor", "ceiling")
+    assert len(set(reasons)) == 3
+
+
+def test_a_valid_gif_header_passes_the_structural_gate(tmp_path):
+    """The acceptance direction of the structural gate: a well-formed artifact
+    in the publishable band must still publish."""
+    good = sparse_file(tmp_path, "good.gif", STILL_FRAME_BYTES)
+    assert good.read_bytes()[:6] == GIF89A_MAGIC
+    proc = run_budget("L0", file=good)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert json_stdout(proc)["publish"] is True
+
+
+def test_nonexistent_file_stays_a_usage_error_not_a_structural_failure(tmp_path):
+    """SPEC 12.1 preserves this boundary explicitly: a missing path is a
+    malformed INVOCATION (exit 2), not a malformed ARTIFACT (exit 13)."""
+    proc = run_budget("L0", file=tmp_path / "absent.gif")
+    assert proc.returncode == 2, "a nonexistent --file path is a usage error"
 
 
 def test_zero_byte_size_argument_hard_fails_on_the_floor():
