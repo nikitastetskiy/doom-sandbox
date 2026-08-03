@@ -480,7 +480,8 @@ def test_all_close_actions_live_under_the_post_push_phase(tmp_path):
     proc, _, actions_path = run_drain(tmp_path, issues, ledger)
     assert proc.returncode == 0
     actions = load_actions(actions_path)
-    assert set(actions) == {"mapping_version", "moves", "post_push"}
+    # `section` is SPEC 5.8 clause 1, unconditional on every exit-0 drain.
+    assert set(actions) == {"mapping_version", "moves", "post_push", "section"}
     assert actions["mapping_version"] == 1
     for entry in actions["post_push"]:
         assert set(entry) == {"issue", "action", "message", "reason"}
