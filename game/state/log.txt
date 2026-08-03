@@ -4,3 +4,5 @@
 2026-08-03T19:42:52Z nikitastetskiy turn-right 1 #8
 2026-08-03T19:42:55Z nikitastetskiy fire 1 #9
 2026-08-03T19:42:59Z nikitastetskiy forward 2 #10
+2026-08-03T19:47:33Z nikitastetskiy new-game 1 #11
+#section 2 engine=f37f5bf81daaa2fc9e39b53d6a52eeff80eb299a build=af458ac9c87a1fc22a529e6dba89089a9a7446c4c86948ea25fd6de534acbfb6 wad=7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d mapping=1
