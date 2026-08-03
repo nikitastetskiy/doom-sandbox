@@ -605,6 +605,72 @@ def test_reason_codes_match_the_spec_enum():
     )
 
 
+def test_section_states_match_the_spec_enum():
+    """SPEC 5.8 is a closed set of three in PRECEDENCE order sealed > capped >
+    open. The consumer selects a state screen by looking the value up, so a
+    reordering or a rename is a runtime contract change, not cosmetics."""
+    contract = re.search(
+        r'"section":\s*\{\s*"state":\s*(.+?)\s*\}', spec_text()
+    )
+    assert contract, "DRIFT [section_states]: could not parse the SPEC §5.8 contract"
+    spec_states = re.findall(r'"([a-z-]+)"', contract.group(1))
+    assert spec_states, "DRIFT [section_states]: SPEC §5.8 contract lists no states"
+    json_states = mapping()["section_states"]
+    assert json_states == spec_states, (
+        f"DRIFT [section_states]: mapping/v1.json={json_states} — "
+        f"game/SPEC.md §5.8={spec_states} (order-sensitive: it is the "
+        f"precedence order)"
+    )
+
+
+def test_section_state_enum_is_closed_at_three():
+    stated = extract(r"\*\*Closed set of (\w+), in precedence order\*\*",
+                     field="section_states.count")
+    json_states = mapping()["section_states"]
+    assert stated.lower() in ("three", "3"), (
+        f"DRIFT [section_states]: game/SPEC.md §5.8 declares a closed set of "
+        f"{stated!r}"
+    )
+    assert len(json_states) == 3, (
+        f"DRIFT [section_states]: mapping/v1.json lists {len(json_states)}"
+    )
+    assert len(set(json_states)) == len(json_states), "duplicate section state"
+
+
+def test_section_state_precedence_is_stated_in_the_spec():
+    """The precedence is the whole reason the order is normative: a section can
+    satisfy both `sealed` and `capped`, and `sealed` must win."""
+    states = mapping()["section_states"]
+    prose = spec_text()
+    sealed_at = prose.find("`sealed` (any header pin")
+    capped_at = prose.find("`capped` (the section is at or above")
+    assert sealed_at != -1 and capped_at != -1, (
+        "DRIFT [section_states]: SPEC §5.8 no longer states the precedence"
+    )
+    assert sealed_at < capped_at, (
+        "DRIFT [section_states]: SPEC §5.8 states capped before sealed"
+    )
+    assert states.index("sealed") < states.index("capped") < states.index("open"), (
+        f"DRIFT [section_states]: mapping order {states} is not the precedence order"
+    )
+
+
+def test_adding_section_states_did_not_widen_the_reason_code_enum():
+    """SPEC 5.7 is explicitly unchanged by SPEC 5.8: section state is a separate
+    top-level field, not a seventh code. The two share the literal `sealed` by
+    design — they answer different questions at different cardinalities — so
+    this guards the COUNT, not disjointness."""
+    assert "section-cap" in mapping()["reason_codes"], (
+        "DRIFT [reason_codes]: the cap reason code was renamed or removed"
+    )
+    assert "capped" not in mapping()["reason_codes"], (
+        "DRIFT [reason_codes]: a SPEC §5.8 section state leaked into the §5.7 enum"
+    )
+    assert "open" not in mapping()["reason_codes"], (
+        "DRIFT [reason_codes]: a SPEC §5.8 section state leaked into the §5.7 enum"
+    )
+
+
 def test_reason_code_enum_is_closed_at_six():
     stated = int(extract(r"\*\*Closed set of (\w+)\.\*\*", field="reason_codes.count")
                  .replace("six", "6"))

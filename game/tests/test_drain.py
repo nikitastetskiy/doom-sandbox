@@ -45,6 +45,30 @@
       currently committed with no consumer). The human-facing "message" string
       stays exactly as it is — reason is additive, never a replacement, and the
       two must agree
+    - AMENDMENT (SPEC 5.8, ratified in 06795ca): the actions JSON gains ONE
+      new TOP-LEVEL member, a sibling of mapping_version / moves / post_push:
+        "section": {"state": "sealed" | "capped" | "open"}
+      It is NOT a seventh reason code (SPEC 5.7 stays closed at six): a reason
+      code answers "why did this issue close this way" once per drained issue,
+      while section state is one fact per RUN that holds just as firmly when
+      nothing was drained. Requirements:
+        * UNCONDITIONAL on every exit-0 drain — empty issue list, all-duplicate
+          batch, nothing-admissible batch included. That quiet case is the one
+          the field exists for. Absent on a non-zero exit (no verdict emitted)
+        * closed set of three in PRECEDENCE order sealed > capped > open,
+          mirrored in mapping section_states; `sealed` wins when both hold,
+          matching the order the drain already applies when admitting moves
+        * reported as of the END of the batch — it describes the section the
+          NEXT move lands in, so an applied `new game` inside the batch makes
+          the state `open`, and a batch that pushes the section to the SPEC §6
+          cap makes it `capped`. Reading it off the pre-loop value is the
+          naive implementation that passes every quiet fixture and lies on the
+          one that matters
+        * run-local: never written to game/state/log.txt or stream.txt, does
+          not bump mapping_version, does not force a `new game`
+      Consumers select the §11 guidance screen by LOOKUP (sealed -> SEALED,
+      capped -> LOG_FULL, open -> none) and hard-fail on an unmapped value;
+      no consumer re-derives the pin comparison or the cap comparison (SPEC 0.5)
     - SEALED MODE (SPEC 5.5, ratified in 5e2c68f). NEW REQUIRED ARGUMENT
       --toolchain PATH: sealing is computed at run time by comparing the
       CURRENT section's header against game/toolchain.json
@@ -743,3 +767,202 @@ def test_zero_eligible_issues_yield_empty_outputs(tmp_path):
     assert moves_path.read_bytes() == b""
     actions = load_actions(actions_path)
     assert actions["moves"] == [] and actions["post_push"] == []
+
+
+# --- SPEC 5.8: section state, the unconditional display witness -----------------
+#
+# The reason codes can only witness a section's state where there was a move to
+# reject, which made the guidance screen a function of player traffic rather
+# than of section state. This field is the witness that does not require a
+# player to have done something (SPEC 0 obligation 4).
+
+# 741 x (run-forward 18 frames x9) = 120,042 >= the 120,000 cap.
+CAP_LINES = [
+    ledger_line("2026-07-30T10:00:00Z", "grinder", "run-forward", 9, i)
+    for i in range(1, 742)
+]
+# 740 x 162 = 119,880 — one full run-forward x9 short of the cap.
+NEAR_CAP_LINES = CAP_LINES[:-1]
+
+
+def section_state(actions_path):
+    """The SPEC 5.8 state, reported as a finding rather than a KeyError."""
+    actions = load_actions(actions_path)
+    assert "section" in actions, (
+        "SPEC 5.8: no top-level `section` member in the actions JSON — it is "
+        "unconditional on every exit-0 drain. Got keys: " + repr(sorted(actions))
+    )
+    assert isinstance(actions["section"], dict), (
+        f"SPEC 5.8: `section` must be an object, got {actions['section']!r}"
+    )
+    assert "state" in actions["section"], (
+        f"SPEC 5.8: `section` carries no `state`, got {actions['section']!r}"
+    )
+    return actions["section"]["state"]
+
+
+QUIET_BATCHES = {
+    # id -> (issues, ledger, the state the section is in throughout)
+    "no-issues-at-all": ([], EMPTY_LEDGER, "open"),
+    "no-doom-issues": ([make_issue(300, "Just a normal issue", TS)], EMPTY_LEDGER,
+                       "open"),
+    "all-duplicates": (
+        [make_issue(5, "doom: fire", TS)],
+        make_section_text([ledger_line(TS, "old", "fire", 1, 5)], n=1),
+        "open",
+    ),
+    "sealed-and-nobody-is-playing": ([], SEALED_LEDGER, "sealed"),
+    "sealed-with-only-duplicates": (
+        [make_issue(5, "doom: fire", TS)], SEALED_LEDGER, "sealed",
+    ),
+    "capped-and-nobody-is-playing": ([], make_section_text(CAP_LINES, n=1), "capped"),
+}
+
+
+@pytest.mark.parametrize("case_id", list(QUIET_BATCHES), ids=list(QUIET_BATCHES))
+def test_section_state_is_emitted_on_a_run_that_drains_nothing(tmp_path, case_id):
+    """Clause 1. The quiet case is not an edge case — it is THE case.
+
+    SPEC 0 review question 2: what output witnesses the property on a run where
+    nothing happens? Before this field the answer was "none".
+    """
+    issues, ledger, expected = QUIET_BATCHES[case_id]
+    proc, moves_path, actions_path = run_drain(tmp_path, issues, ledger)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert moves_path.read_bytes() == b"", "this fixture must drain nothing"
+    assert section_state(actions_path) == expected
+
+
+@pytest.mark.parametrize("case_id", list(QUIET_BATCHES), ids=list(QUIET_BATCHES))
+def test_a_quiet_batch_carries_no_reason_code_that_could_witness_the_state(
+    tmp_path, case_id
+):
+    """Why the field had to be added rather than derived from the codes.
+
+    Every batch above emits no `sealed` and no `section-cap` code, so a
+    consumer reading only the codes cannot tell a sealed quiet game from a
+    healthy one.
+    """
+    issues, ledger, _ = QUIET_BATCHES[case_id]
+    proc, _, actions_path = run_drain(tmp_path, issues, ledger)
+    assert proc.returncode == 0
+    codes = {entry["reason"] for entry in load_actions(actions_path)["post_push"]}
+    assert not (codes & {REASON_SEALED, REASON_SECTION_CAP}), codes
+
+
+def test_section_state_is_one_of_the_mapping_section_states(tmp_path):
+    proc, _, actions_path = run_drain(tmp_path, [], EMPTY_LEDGER)
+    assert proc.returncode == 0
+    assert section_state(actions_path) in load_mapping()["section_states"]
+
+
+def test_a_sealed_section_at_its_cap_reports_sealed_not_capped(tmp_path):
+    """Clause 2 precedence: sealed beats capped, the same order the drain
+    already applies when admitting moves, so the reported state and the
+    admission decision cannot disagree."""
+    ledger = sealed_section_text(CAP_LINES, n=1)
+    proc, _, actions_path = run_drain(tmp_path, [], ledger)
+    assert proc.returncode == 0
+    assert section_state(actions_path) == "sealed"
+
+
+def test_an_applied_reset_leaves_a_sealed_section_reporting_open(tmp_path):
+    """Clause 3, the load-bearing one, in the direction that cannot lie.
+
+    Read off the pre-loop value this reports `sealed` and the run leaves SEALED
+    on a profile it just healed. The state describes the section the NEXT move
+    lands in.
+    """
+    issues = [make_issue(40, "doom: new game", TS, login="rescuer")]
+    proc, moves_path, actions_path = run_drain(tmp_path, issues, SEALED_LEDGER)
+    assert proc.returncode == 0
+    assert moves_path.read_text(encoding="ascii").endswith("new-game 1 #40\n"), (
+        "the rollover must actually land for this to test the end-of-batch rule"
+    )
+    assert section_state(actions_path) == "open"
+
+
+def test_an_applied_reset_leaves_a_capped_section_reporting_open(tmp_path):
+    """Clause 3 for the cap half — the symmetry that makes this an enum rather
+    than a `sealed` boolean."""
+    issues = [make_issue(9002, "doom: new game", TS, login="rescuer")]
+    proc, moves_path, actions_path = run_drain(
+        tmp_path, issues, make_section_text(CAP_LINES, n=1)
+    )
+    assert proc.returncode == 0
+    assert moves_path.read_text(encoding="ascii").endswith("new-game 1 #9002\n")
+    assert section_state(actions_path) == "open"
+
+
+def test_a_batch_that_reaches_the_cap_reports_capped(tmp_path):
+    """Clause 3 in the other direction: the state can also WORSEN in-batch."""
+    issues = [make_issue(9100, "doom: run-forward x9", TS)]
+    proc, moves_path, actions_path = run_drain(
+        tmp_path, issues, make_section_text(NEAR_CAP_LINES, n=1)
+    )
+    assert proc.returncode == 0
+    assert moves_path.read_text(encoding="ascii").endswith("run-forward 9 #9100\n"), (
+        "the move must be APPLIED for this to exercise the end-of-batch rule"
+    )
+    assert section_state(actions_path) == "capped"
+
+
+def test_a_batch_that_stays_below_the_cap_reports_open(tmp_path):
+    """The discriminating partner of the test above: same ledger, smaller move."""
+    issues = [make_issue(9101, "doom: use", TS)]
+    proc, moves_path, actions_path = run_drain(
+        tmp_path, issues, make_section_text(NEAR_CAP_LINES, n=1)
+    )
+    assert proc.returncode == 0
+    assert moves_path.read_text(encoding="ascii").endswith("use 1 #9101\n")
+    assert section_state(actions_path) == "open"
+
+
+def test_section_state_is_computed_from_the_current_section_not_the_first(tmp_path):
+    """Archived sections legitimately carry the pins they were played under —
+    the same rule SPEC 5.5 applies to sealing."""
+    ledger = sealed_section_text(
+        [ledger_line("2026-08-02T09:30:00Z", "carol", "new-game", 1, 6)]
+    ) + make_section_text([], n=2)
+    proc, _, actions_path = run_drain(tmp_path, [], ledger)
+    assert proc.returncode == 0
+    assert section_state(actions_path) == "open"
+
+
+def test_section_state_is_never_written_into_the_ledger_batch(tmp_path):
+    """Clause 4: run-local. A ledger line is exactly the 5 fields of SPEC 5.3."""
+    issues = [make_issue(9200, "doom: fire", TS)]
+    proc, moves_path, _ = run_drain(tmp_path, issues, EMPTY_LEDGER)
+    assert proc.returncode == 0
+    batch = moves_path.read_text(encoding="ascii")
+    for token in ("section", "sealed", "capped", "open", "state"):
+        assert token not in batch, batch
+
+
+def test_section_state_does_not_change_the_mapping_version_the_drain_reports(tmp_path):
+    """Clause 4: adding the field is not a serialization change."""
+    proc, _, actions_path = run_drain(tmp_path, [], EMPTY_LEDGER)
+    assert proc.returncode == 0
+    assert load_actions(actions_path)["mapping_version"] == load_mapping()[
+        "mapping_version"
+    ]
+
+
+def test_section_state_does_not_displace_any_existing_top_level_member(tmp_path):
+    """Additive: `section` is a SIBLING of the three members consumers already
+    read, not a replacement for or a nesting of any of them."""
+    proc, _, actions_path = run_drain(tmp_path, [], EMPTY_LEDGER)
+    assert proc.returncode == 0
+    actions = load_actions(actions_path)
+    assert {"mapping_version", "moves", "post_push"} <= set(actions)
+    assert set(actions) == {"mapping_version", "moves", "post_push", "section"}, (
+        f"unexpected top-level members: {sorted(actions)}"
+    )
+
+
+def test_section_state_is_deterministic_for_identical_inputs(tmp_path):
+    """The whole drain is byte-deterministic; the new field must not break it."""
+    issues = [make_issue(9300, "doom: fire", TS)]
+    first = run_drain(tmp_path / "a", issues, SEALED_LEDGER)[2].read_bytes()
+    second = run_drain(tmp_path / "b", issues, SEALED_LEDGER)[2].read_bytes()
+    assert first == second
