@@ -102,9 +102,11 @@
     "defect_p50_seconds": 180,
     "stretch_p50_seconds": 60
   },
+  "reason_codes": ["applied", "duplicate", "grammar", "cooldown", "section-cap", "sealed"],
   "budget": {
     "ceiling_bytes": 4000000,
     "floor_bytes": 16000,
+    "structure": { "magic_hex": "474946383961", "trailer_hex": "3b" },
     "ladder": [
       { "level": "L0", "tail_seconds": 15, "width_px": 320, "fps": 12, "colors": 128 },
       { "level": "L1", "tail_seconds": 12, "width_px": 320, "fps": 12, "colors": 128 },

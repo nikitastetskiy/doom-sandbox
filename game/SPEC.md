@@ -4,6 +4,22 @@ Plan-time spec artifact designated by RFC 001 (`.yui-soul/rfcs/approved/001-play
 
 Engine timing basis: DOOM runs at **35 tics/sec**; one doomreplay input frame = one tic. Approximate durations below use 35 fps.
 
+## 0. How this document specifies a gate (normative)
+
+Several sections here define a **gate**: the parse rule (§4), the seal (§5.5), the section cap (§6), the publish gate (§12.1). Each exists because some artifact or input was wrong in a way nothing downstream noticed. Gates have a characteristic failure mode of their own, and this plan has now hit it twice: **a gate gets specified against the instance that prompted it rather than the class it must cover.** The drift is invisible, because the predicate passes its own motivating example and ships.
+
+The second instance is this document's. §12.1 was written after "the gate that was meant to catch them" was logged as failure instance four; §12.1 then named *a truncated GIF* as a motivating case and specified a predicate structurally incapable of detecting one. Naming the right class in the prose did not produce a predicate that covers it, because the enumeration underneath was still a list of rejects.
+
+Therefore a gate in this document is specified as three things, in this order:
+
+1. **The positive property it establishes** — stated as a property an accepted artifact *has*, never as a list of artifacts it turns away. "The file carries the header a GIF encoder writes first and the terminator it writes last" is a property; "the file is not empty and not a PNG" is a list.
+2. **The evidence it reads** — the exact bytes, fields, or comparisons, and their cost.
+3. **The residual it does not cover** — what can still be wrong in an artifact that passes, and why closing that remainder was judged disproportionate. **A gate with no stated residual is unfinished, not perfect.**
+
+Enumerations of known-bad artifacts are **illustrative only**. They motivate a predicate and they belong in tests; they are never the definition, and a predicate is never complete merely because it rejects every example printed beside it.
+
+**The review question for any new or amended gate**: *does the predicate establish the stated property, or does it only reject the examples named next to it?* If the second, the gate is not specified yet. Applied to §12.1's original step 1: the stated property was "well-formed GIF", the evidence was the leading magic, and the magic cannot speak to any byte after offset 5 — so the property was never established, and the residual (everything after the header) was never written down where a reader could see it.
+
 ## 1. Token enum and canonical title literals
 
 Closed set. Title literals are exact byte strings — case-sensitive, single `0x20` space after `doom:` and around `x<count>`, no leading/trailing whitespace.
@@ -104,7 +120,7 @@ A section is **sealed** when any field of its header (`engine`, `build`, `wad`, 
 4. **Defense in depth.** `game/scripts/apply_moves.py` independently enforces invariant 1: if any frame-contributing line would land in a sealed section it **refuses with exit code 7** and leaves the ledger byte-unchanged, even though correct drain behavior means it should never see such a batch. A frame-contributing move ordered *ahead* of a reset in the same batch is refused by this path.
 5. **Moves after the rollover apply normally.** Once the reset opens a fresh section, that section's pins match the running toolchain by construction, so later moves in the same batch land in it and are simulated normally.
 6. **Recovery is always reachable**: the `new game` cooldown (§6) does **not** apply while the current section is sealed. A sealed game cannot advance, so the cooldown's purpose — preventing reset-griefing of a live game — is inapplicable, and a visitor cannot induce a mismatch (pins change only through a default-branch commit).
-7. **Player-visible state.** While sealed, the README game block shows the **SEALED** guidance screen (§11). A run whose drained moves are all sealed-rejects is a **successful run with zero ledger appends**: it performs a display-only swap to SEALED and commits no game state (§10).
+7. **Player-visible state.** While sealed, the README game block shows the **SEALED** guidance screen (§11). A run that **appends no ledger line to a sealed section** is a **successful run with zero ledger appends**: it performs a display-only swap to SEALED and commits no game state (§10). The governing property is "no frame-contributing line landed", not "a rejection was issued" — the sealed-reject batch of rule 3, a batch that is entirely duplicates (§5.3 idempotency key), and a batch with nothing admissible in it at all are the *same* case and take the *same* path. In particular rule 1's prohibition is **unconditional**: `stream.txt` is not regenerated in any of them. Regeneration is never contingent on whether the run had something to reject — a sealed section is never re-simulated, full stop.
 
 **Rollover recovery render.** The fresh section is empty, so the recovery run replays zero frames and renders the game-start view — the same path already exercised by the initial committed state (§5.1).
 
@@ -125,6 +141,23 @@ Strictly bounded:
 
 **The rollover remains the guarantee.** If an entry-less section is ever left un-re-initialized — at cutover or after any future bump — §5.5 still heals it in band without an operator. §5.6 is an optimization for the authoring case, never a dependency.
 
+### 5.7 Drain reason codes (normative closed enum)
+
+Every drained issue closes with exactly **one** reason code. The workflow branches on these codes — `section-cap` selects the LOG_FULL state screen and `sealed` selects SEALED (§11) — so the code, not the player-visible prose, is the machine contract. **No consumer may string-match a player-visible message**: those are written for humans and may be reworded; the codes may not.
+
+| Reason code | Issue action | Emitted when | Player-visible message |
+|---|---|---|---|
+| `applied` | `close-applied` | the move parsed, passed every guard, and its ledger line landed | receipt (§10) |
+| `duplicate` | `close-duplicate` | the issue number is already present in the ledger — the §5.3 exactly-once idempotency key (RFC D14) | receipt |
+| `grammar` | `close-reject` | the title failed the §4 parse rule (any reject class) | fixed rejection message (§4) |
+| `cooldown` | `close-reject` | a `new game` inside the §6 cooldown window; never applies while sealed (§5.5 rule 6) | fixed cooldown message |
+| `section-cap` | `close-reject` | the section is at the §6 log-section cap; only `doom: new game` is accepted | `log full — start a new game` (§6, verbatim) |
+| `sealed` | `close-reject` | the current section is sealed by a pin mismatch (§5.5 rule 3) | `the arcade is being upgraded — press New game to continue` (§5.5, verbatim) |
+
+- **Closed set of six.** The enum is exhaustive: a drained issue that matches no row is a bug, not a seventh outcome. Adding a code is a spec change, and it lands here, in `game/mapping/v1.json` `reason_codes`, and in the drift guard together.
+- **Reason and action never disagree**, because the action is *derived* from the reason rather than passed alongside it — one field cannot drift from the other if only one is authored.
+- **Reason codes are run-local diagnostics.** They are carried in the drain's JSON output and in receipts; they are **never serialized into `game/state/log.txt` or `game/state/stream.txt`** (a ledger line is exactly the 5 fields of §5.3). They are therefore **not** section 1/2/5 *values*, and mirroring an already-implemented code into the mapping does **not** bump `mapping_version` and does **not** force a `new game`. Changing a code's *string*, however, changes a runtime contract the workflow reads, and requires the same coordinated commit as any other mirrored constant.
+
 ## 6. Knob values (RFC OQ5 — resolved here, not post-launch)
 
 | Knob | Value | Notes |
@@ -137,6 +170,7 @@ Strictly bounded:
 | Sweep cron | **`17 */6 * * *`** (every 6 h at :17) | Off-peak minute to dodge busy-window delivery lag; no-ops cheaply when idle |
 | Sweep owner-alert threshold | **2 consecutive failed heavy runs** | Opens/updates the maintenance issue assigned to Nik |
 | Trailing-24h abuse run-count threshold | **200 workflow runs / 24 h** | Sweep flips README to PAUSED and alerts (RFC must_have 7 defense) |
+| Idle-to-PAUSED threshold | **45 days** | Days since the last game-state commit before the sweep swaps the block to PAUSED (§11). Comfortably inside the 60-day scheduled-workflow auto-disable, so the swap always happens while the workflow is still alive to perform it. Mirrors `knobs.idle_pause_days` |
 | Title byte cap | **64 bytes** | Section 4 |
 | Receipt degradation trigger | **first secondary-limit 403 in a run** ⇒ drop reactions for the rest of the run; **second 403** ⇒ drop comments too | Issue closes are always attempted; a failed close is retried next run as close-only cleanup (never decoupled from the ledger) |
 
@@ -191,17 +225,31 @@ Degraded-mode note (§5.5, §6 cap): a run whose drained moves are **all** rejec
   - **L2**: 12 s tail @ 256 px / 10 fps / 64 colors
 ### 12.1 Publication requires positive structural evidence (normative)
 
-The publish gate must **affirmatively establish that the artifact is a well-formed, non-degenerate GIF**. The absence of a ceiling violation is not evidence of anything: a 0-byte file, a truncated file, and a palette-collapsed file all satisfy "not too large". This plan has now produced four failure instances in which exit status and byte count both reported success while the artifact was wrong (`bgr0` palette collapse, the title-screen preamble, the 0-byte GIF, and the gate that was meant to catch them) — **treat a clean exit code as the weakest available evidence.**
+The publish gate must **affirmatively establish that the artifact is a well-formed, non-degenerate GIF**. The absence of a ceiling violation is not evidence of anything: a 0-byte file, a truncated file, and a palette-collapsed file all satisfy "not too large". This plan has now produced **five** failure instances in which exit status and byte count both reported success while the artifact was wrong: `bgr0` palette collapse, the title-screen preamble, the 0-byte GIF, the gate that was meant to catch them, and — instance five — **this section's own first predicate**, which named a truncated GIF as its motivating case and then specified head-only evidence, which cannot detect one. Verified 2026-08-03 against the committed gate: a 1.5 MB file consisting of a valid `GIF89a` header followed by unterminated data returned **exit 0, publish: true**. **Treat a clean exit code as the weakest available evidence** — and treat a gate's own prose about what it catches as no evidence at all until the predicate is checked against it (§0).
 
 Gate order, all three required before publication:
 
-1. **Structural validity** — the file exists, is non-empty, and begins with the `GIF89a` magic bytes. May additionally be enforced in the workflow (where it fails faster and logs better), but `budget.py` enforces it **independently and unconditionally** before any size verdict — the script never assumes an upstream gate ran. Same defense-in-depth precedent as §5.5 rule 4.
+1. **Structural validity** — *positive property*: the artifact is the **complete** output of a GIF writer. *Evidence*: the file exists, is non-empty, **begins** with the `GIF89a` magic (bytes 0–5) **and ends** with the GIF trailer byte `0x3B`. Head **and** tail, because the two ends establish different halves of the property and neither substitutes for the other: the magic proves a GIF writer **started**; the trailer is the last byte the GIF muxer emits, so it proves a writer **finished**. Head-only evidence is structurally incapable of detecting truncation — truncation removes bytes from the *end*, and the magic lives at the *start*, so no amount of care in reading the header can speak to a single byte after offset 5. *Cost*: two seeks and seven bytes; no decoding, no dependency, the same **kind** of evidence as the magic rather than a new class of check. Constants are mirrored in `game/mapping/v1.json` (`budget.structure.magic_hex`, `budget.structure.trailer_hex`) and read at runtime, so the literal is authored once rather than repeated in the script, the workflow, and this file. May additionally be enforced in the workflow (where it fails faster and logs better), but `budget.py` enforces it **independently and unconditionally** before any size verdict — the script never assumes an upstream gate ran. Same defense-in-depth precedent as §5.5 rule 4.
 2. **Floor** — `size > floor_bytes` (§12).
 3. **Ceiling / ladder** — `size <= ceiling_bytes`, otherwise descend the ladder (§12).
 
+**What step 1 does not establish (residual, per §0.3).** Head-and-tail evidence proves a writer started and finished. It does **not** prove the block chain between them is intact. Three things can still be wrong in an artifact that passes:
+
+- **(a) Truncation at an offset whose byte happens to be `0x3B`.** Measured at ~0.3 % of offsets in a reference L0 artifact (2,064 occurrences in 705,961 bytes), so this narrows the truncation hole by roughly two orders of magnitude rather than closing it. A partially written encode essentially never stops there, but it can.
+- **(b) Corruption strictly between head and tail** — damaged or interleaved blocks with both ends intact.
+- **(c) A structurally complete but semantically degenerate GIF** — palette collapse, blank frames. Deliberately **not** step 1's job: that failure is size-detectable and belongs to the floor (§12), and its root cause is prevented upstream by the pinned `bgr0` input declaration (`game/toolchain.json`).
+
+Closing (a) and (b) requires walking the GIF block chain — a decoder dependency inside the publish gate, run against an artifact the same job produced seconds earlier. **Rejected as disproportionate**: it adds a dependency and a new failure surface of its own to cover a corruption mode this pipeline has never produced, whereas truncation — a partially written encode — is a mode it *can* produce, and head-and-tail does catch it. Revisit if an artifact that passed this gate is ever observed to render broken.
+
+**Step precedence.** The steps are ordered and **the first violated step alone produces the verdict.** An artifact may violate more than one — a 2.4 KB PNG is both structurally invalid and sub-floor — and the verdict is the lowest-numbered violation: `13`, never `12`. This is not a tie-break convenience. The exit codes name *different faults with different first debugging steps* (below), and structural invalidity is the **upstream** fault: a non-GIF's byte count is a property of the wrong file, so reporting it as a floor violation would send the operator into the palette/`pix_fmt` path for a problem that is not in the encoder's colour handling. Size is only a meaningful question once the artifact is established to be a GIF at all.
+
+**`--size` is not a publication path.** `--size` asserts a byte count with no artifact behind it, so step 1 has nothing to read. Structural evidence there is not *skipped* — it is **unavailable**, and by §0 a gate that cannot establish its property has not passed it. Therefore: **a publication decision is made only from `--file`.** `--size` is a tuning and diagnostic entry point (ladder arithmetic, threshold checks) and its exit code is a **size verdict only**. This is why `--size 0` yields `12` while a 0-byte *file* yields `13`: not a contradiction, but two different questions — the first asks "is this number below the floor?", the second asks "is this artifact a GIF?". The workflow's publish step passes `--file` and must continue to.
+
+**`GIF89a` is matched exactly, and that is a declared toolchain dependency.** The version block is not wildcarded to also accept `GIF87a`. The pinned encoder (`game/toolchain.json` `ffmpeg`, invoked `-f gif`) writes the 89a block unconditionally — verified 2026-08-03 on ffmpeg 8.1.2 with the §12 L0 filtergraph, which produced a `GIF89a`-headed, `0x3B`-terminated artifact — so an 87a file is not something this pipeline can emit, and an artifact that is *not what the pinned toolchain produces* is itself the structural fault this gate exists to catch. Widening the match would trade real evidence for compatibility with an encoder this repository does not use. **Re-verify if the encoder, its version pin, or the `-f gif` muxer changes** — the same re-verify discipline the floor carries (§12).
+
 **Floor violation behavior**: `size <= floor_bytes` is a **hard failure — exit code 12, no publish, and no ladder descent**, regardless of the current rung. The ladder exists to make oversized output smaller; descending a rung on an undersized artifact makes it *smaller still*, which cannot repair it and merely burns encodes. A sub-floor artifact is evidence that the encode is broken (collapse, truncation, zero-length), not that it is mis-tuned. The run then takes the **pre-push failure** path of the write contract (§10): game state untouched, best-effort UNAVAILABLE swap, issues left open, next run retries.
 
-**Structural failure behavior**: an artifact that is empty, or does not begin with `GIF89a`, is a **hard failure — exit code 13**, no publish, no ladder descent, `reason: "structure"`. It is deliberately *not* folded into the floor verdict, because **structural validity is orthogonal to size**. Folding would be correct only for the 0-byte case, where `0 <= floor_bytes` holds by coincidence; a *large* malformed artifact — a truncated GIF, or the wrong file entirely (a PNG, an HTML error page) — clears both floor and ceiling and would **publish**, which is the precise hole this section exists to close. It would also mislabel a 1.5 MB truncated file as a floor violation.
+**Structural failure behavior**: an artifact that fails to establish the step 1 property — empty, missing the `GIF89a` head, or missing the `0x3B` tail — is a **hard failure — exit code 13**, no publish, no ladder descent, `reason: "structure"`. It is deliberately *not* folded into the floor verdict, because **structural validity is orthogonal to size**. Folding would be correct only for the 0-byte case, where `0 <= floor_bytes` holds by coincidence; a *large* malformed artifact — a truncated GIF, or the wrong file entirely (a PNG, an HTML error page) — clears both floor and ceiling and would **publish**. That is the precise hole this section exists to close, and until the trailer check was added it was only half closed: the wrong-file half was caught, the truncation half published. It would also mislabel a 1.5 MB truncated file as a floor violation.
 
 A **nonexistent `--file` path remains a usage error (exit 2)**: that is a malformed invocation, not a malformed artifact.
 
