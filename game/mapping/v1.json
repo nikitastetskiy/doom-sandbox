@@ -104,6 +104,7 @@
     "stretch_p50_seconds": 60
   },
   "reason_codes": ["applied", "duplicate", "grammar", "cooldown", "section-cap", "sealed"],
+  "section_states": ["sealed", "capped", "open"],
   "budget": {
     "ceiling_bytes": 4000000,
     "floor_bytes": 16000,
