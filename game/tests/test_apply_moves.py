@@ -467,6 +467,48 @@ def test_moves_after_a_sanctioned_rollover_apply_normally(tmp_path):
     assert [e.issue for e in log.sections[-1].entries] == [21]
 
 
+def test_sealed_section_with_empty_batch_is_success_with_no_writes(tmp_path):
+    """SPEC 5.5 rule 7: a run whose drained moves are all sealed-rejects is a
+    SUCCESS with zero ledger appends — the drain rejected everything in-band,
+    so apply_moves receives an empty batch. It is not a failure row of the
+    write contract: nothing failed and no game state was eligible to change.
+    The sealed section's stream is NOT regenerated (rule 1)."""
+    before = one_section([ledger_line("2026-08-02T09:00:00Z", "carol", "fire", 1, 5)])
+    proc, ledger, stream = run_apply(
+        tmp_path, before, "", engine="99" * 20, stream_text="deliberately-stale\n",
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert ledger.read_text(encoding="ascii") == before, "zero ledger appends"
+    assert stream.read_text(encoding="ascii") == "deliberately-stale\n", (
+        "a sealed section is never re-simulated, so its stream stands"
+    )
+
+
+def test_sealed_section_with_all_duplicate_moves_is_success_with_no_writes(tmp_path):
+    """The other no-admissible-batch shape: every drained line is already in
+    the ledger (idempotency key), so nothing lands in the sealed section."""
+    already = ledger_line("2026-08-02T09:00:00Z", "carol", "fire", 1, 5)
+    before = one_section([already])
+    proc, ledger, stream = run_apply(
+        tmp_path, before, already + "\n", engine="99" * 20,
+        stream_text="deliberately-stale\n",
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert ledger.read_text(encoding="ascii") == before
+    assert stream.read_text(encoding="ascii") == "deliberately-stale\n"
+
+
+def test_unsealed_section_with_empty_batch_still_regenerates_the_stream(tmp_path):
+    """The rule-1 exemption is scoped to SEALED sections: an unsealed run with
+    nothing to append still re-renders, which is the idempotent path doom.yml's
+    push-retry loop depends on."""
+    before = one_section([ledger_line("2026-08-02T09:00:00Z", "carol", "fire", 1, 5)])
+    proc, ledger, stream = run_apply(tmp_path, before, "", stream_text="stale\n")
+    assert proc.returncode == 0
+    assert ledger.read_text(encoding="ascii") == before
+    assert stream.read_text(encoding="ascii") == expected_stream_text([("fire", 1)])
+
+
 # --- Input validation ---------------------------------------------------------------
 
 def test_missing_ledger_file_is_a_usage_error(tmp_path):

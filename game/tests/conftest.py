@@ -300,26 +300,55 @@ def run_budget(rung, *, size=None, file=None, mapping=MAPPING_PATH):
     return run_script("budget.py", args)
 
 
-GIF89A_MAGIC = b"GIF89a"  # SPEC 12.1 gate step 1
+# SPEC 12.1 gate step 1, mirrored in mapping budget.structure.
+GIF89A_MAGIC = b"GIF89a"   # magic_hex 474946383961 — proves a writer STARTED
+GIF_TRAILER = b"\x3b"      # trailer_hex 3b — proves a writer FINISHED
 
 
-def sparse_file(tmp_path, name, size, *, magic=GIF89A_MAGIC):
+def sparse_file(tmp_path, name, size, *, magic=GIF89A_MAGIC, trailer=GIF_TRAILER):
     """Create a file of exactly `size` bytes without writing `size` bytes.
 
-    Fixtures carry the GIF89a magic by default so they satisfy SPEC 12.1 gate
-    step 1 (structural validity) wherever it is enforced — the spec permits it
-    in the workflow OR in the script, and these fixtures must not force that
-    choice. Pass magic=b"" to build a deliberately degenerate artifact.
+    Fixtures are structurally complete by default — GIF89a head AND 0x3B tail —
+    because SPEC 12.1 step 1 establishes "the complete output of a GIF writer"
+    from BOTH ends. A fixture that merely started with the magic would now be a
+    truncated artifact and fail the gate.
+
+    Escapes for building deliberately broken artifacts:
+      magic=b""    -> not a GIF at all (wrong file: PNG, HTML error page)
+      trailer=b""  -> valid header, unterminated body (TRUNCATED)
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / name
-    head = magic[:size] if size else b""
+    head = magic[:size]
     with open(path, "wb") as fh:
         fh.write(head)
         if size > len(head):
             fh.seek(size - 1)
-            fh.write(b"\0")
+            fh.write(trailer[:1] if trailer else b"\0")
     assert path.stat().st_size == size
+    return path
+
+
+def assert_fixture_shape(path, *, magic, trailer, size=None):
+    """Assert a fixture IS the artifact the test intends, before asserting what
+    the gate does to it.
+
+    A test whose name describes truncation while its fixture strips the magic
+    asserts a different predicate than it advertises — the prose-vs-predicate
+    gap SPEC section 0 exists to prevent, reproduced in test names. Call this
+    first so the fixture cannot silently drift from the case being claimed.
+    """
+    blob = path.read_bytes()
+    if size is not None:
+        assert len(blob) == size, f"fixture size {len(blob)}, expected {size}"
+    has_magic = blob[:len(GIF89A_MAGIC)] == GIF89A_MAGIC
+    has_trailer = blob[-1:] == GIF_TRAILER
+    assert has_magic is magic, (
+        f"fixture magic: got {blob[:6]!r}, expected GIF89a present={magic}"
+    )
+    assert has_trailer is trailer, (
+        f"fixture trailer: got {blob[-1:]!r}, expected 0x3B present={trailer}"
+    )
     return path
 
 

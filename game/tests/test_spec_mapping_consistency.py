@@ -563,6 +563,59 @@ def test_budget_floor_is_below_the_ceiling():
     )
 
 
+def test_structure_constants_match_spec():
+    """SPEC 12.1 step 1 evidence, authored once and mirrored in the mapping."""
+    structure = mapping()["budget"]["structure"]
+    spec_magic = extract(r"`(GIF89a)` magic", field="budget.structure.magic_hex")
+    assert bytes.fromhex(structure["magic_hex"]) == spec_magic.encode("ascii"), (
+        f"DRIFT [budget.structure.magic_hex]: mapping/v1.json decodes to "
+        f"{bytes.fromhex(structure['magic_hex'])!r} — game/SPEC.md §12.1 "
+        f"states {spec_magic!r}"
+    )
+    spec_trailer = extract(r"trailer byte `0x([0-9A-Fa-f]{2})`",
+                           field="budget.structure.trailer_hex")
+    assert structure["trailer_hex"].lower() == spec_trailer.lower(), (
+        f"DRIFT [budget.structure.trailer_hex]: mapping/v1.json has "
+        f"{structure['trailer_hex']!r} — game/SPEC.md §12.1 states {spec_trailer!r}"
+    )
+
+
+def test_structure_evidence_reads_both_ends():
+    """The residual §0.3 requires stated: head-only evidence cannot detect
+    truncation, so both constants must be present and distinct."""
+    structure = mapping()["budget"]["structure"]
+    assert set(structure) == {"magic_hex", "trailer_hex"}, (
+        f"DRIFT [budget.structure]: expected exactly magic_hex and trailer_hex, "
+        f"got {sorted(structure)}"
+    )
+    for key in ("magic_hex", "trailer_hex"):
+        assert structure[key], f"DRIFT [budget.structure.{key}]: empty gates nothing"
+        bytes.fromhex(structure[key])  # must decode
+
+
+def test_reason_codes_match_the_spec_enum():
+    """SPEC 5.7 is a closed enum of six; the workflow branches on these codes,
+    so mapping and SPEC must agree exactly."""
+    spec_codes = re.findall(r"^\| `([a-z-]+)` \| `close-\w+` \|", spec_text(), re.M)
+    assert spec_codes, "DRIFT [reason_codes]: could not parse the SPEC §5.7 table"
+    json_codes = mapping()["reason_codes"]
+    assert json_codes == spec_codes, (
+        f"DRIFT [reason_codes]: mapping/v1.json={json_codes} — "
+        f"game/SPEC.md §5.7={spec_codes} (order-sensitive)"
+    )
+
+
+def test_reason_code_enum_is_closed_at_six():
+    stated = int(extract(r"\*\*Closed set of (\w+)\.\*\*", field="reason_codes.count")
+                 .replace("six", "6"))
+    json_codes = mapping()["reason_codes"]
+    assert len(json_codes) == stated == 6, (
+        f"DRIFT [reason_codes]: mapping/v1.json lists {len(json_codes)} — "
+        f"game/SPEC.md §5.7 declares a closed set of {stated}"
+    )
+    assert len(set(json_codes)) == len(json_codes), "duplicate reason code"
+
+
 def test_ladder_rung_count_matches_spec():
     spec_rungs = spec_ladder()
     json_rungs = mapping()["budget"]["ladder"]

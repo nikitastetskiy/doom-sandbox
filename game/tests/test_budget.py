@@ -6,18 +6,34 @@
     fail, no publish, NO ladder descent / 13 structurally invalid artifact,
     hard fail, no publish, NO ladder descent / 2 usage
 @behavior
-    - Gate order is normative (SPEC 12.1): (1) structural validity — exists,
-      non-empty, GIF89a magic; (2) floor; (3) ceiling/ladder. budget.py
-      enforces step 1 INDEPENDENTLY AND UNCONDITIONALLY before any size
-      verdict — it never assumes the workflow gate ran, on the same
-      defense-in-depth precedent as SPEC 5.5 rule 4. The workflow gate stays
-      too, because it fails faster and logs better; both is the point
+    - Gate order is normative (SPEC 12.1): (1) structural validity; (2) floor;
+      (3) ceiling/ladder. budget.py enforces step 1 INDEPENDENTLY AND
+      UNCONDITIONALLY before any size verdict — it never assumes the workflow
+      gate ran, on the same defense-in-depth precedent as SPEC 5.5 rule 4. The
+      workflow gate stays too, because it fails faster and logs better
+    - Step 1 positive property: the artifact is the COMPLETE output of a GIF
+      writer. Evidence: exists, non-empty, BEGINS with the GIF89a magic AND
+      ENDS with the 0x3B trailer — head and tail, because the magic proves a
+      writer started and the trailer proves one finished, and neither
+      substitutes for the other. Head-only evidence is structurally incapable
+      of detecting truncation: truncation removes bytes from the END and the
+      magic lives at the START. Both constants are read at runtime from
+      mapping budget.structure (magic_hex / trailer_hex), never hardcoded
+    - Step precedence: the FIRST violated step alone produces the verdict. An
+      artifact may violate several — a 2.4 KB PNG is both structurally invalid
+      and sub-floor — and the answer is the lowest-numbered violation: 13,
+      never 12. Structural invalidity is the upstream fault; a non-GIF's byte
+      count is a property of the wrong file
     - Structural failure is exit 13 with reason "structure", deliberately NOT
       folded into the floor verdict: structural validity is ORTHOGONAL to
       size. Folding is correct only for the 0-byte case where 0 <= floor_bytes
       holds by coincidence; a LARGE malformed artifact (truncated GIF, PNG,
-      HTML error page) clears floor and ceiling and would publish. It would
-      also mislabel a 1.5 MB truncated file as a floor violation
+      HTML error page) clears floor and ceiling and would publish
+    - --size is NOT a publication path: it asserts a byte count with no
+      artifact behind it, so step 1 has nothing to read — structural evidence
+      is unavailable, not skipped. Publication decisions come only from --file.
+      Hence --size 0 yields 12 while a 0-byte FILE yields 13: two different
+      questions, not a contradiction
     - Operator meaning of the two hard-fail integers: 13 = the encoder emitted
       garbage or the wrong file (pipeline/toolchain fault); 12 = the encoder
       emitted a well-formed but degenerate clip (palette/pix_fmt fault).
@@ -61,6 +77,7 @@ from conftest import (
     CLIP_18_FRAME_BYTES,
     COLLAPSE_SIGNATURE_BYTES,
     GIF89A_MAGIC,
+    assert_fixture_shape,
     LADDER_LEVELS,
     LADDER_PX_FPS_COLORS,
     STILL_FRAME_BYTES,
@@ -314,7 +331,10 @@ def test_zero_byte_gif_is_a_structural_failure(tmp_path):
     """The reported bug: a 0-byte GIF returned publish/exit 0. budget.py
     enforces structure independently and unconditionally (SPEC 12.1 step 1) —
     it never assumes the workflow gate ran."""
-    empty = sparse_file(tmp_path, "empty.gif", 0, magic=b"")
+    empty = assert_fixture_shape(
+        sparse_file(tmp_path, "empty.gif", 0, magic=b""),
+        magic=False, trailer=False, size=0,
+    )
     proc = run_budget("L0", file=empty)
     assert proc.returncode == 13, (proc.stdout, proc.stderr)
     out = json_stdout(proc)
@@ -324,48 +344,83 @@ def test_zero_byte_gif_is_a_structural_failure(tmp_path):
     assert out["reason"] == "structure"
 
 
-def test_large_malformed_artifact_is_a_structural_failure_not_a_publish(tmp_path):
-    """THE case that motivated exit 13 (SPEC 12.1).
+def test_large_truncated_gif_is_rejected(tmp_path):
+    """THE headline regression (SPEC 12.1 instance five).
 
-    Structural validity is orthogonal to size. Folding structure into the floor
-    verdict is correct only for the 0-byte case, where 0 <= floor_bytes holds
-    by coincidence. A LARGE malformed artifact — a truncated GIF, a PNG, an
-    HTML error page saved as .gif — clears the floor AND the ceiling and would
-    publish, reopening the exact hole this gate exists to close, one layer
-    down.
+    A valid GIF89a header with an unterminated body, comfortably above the
+    floor: this is the artifact that actually published to Nik's profile. It
+    clears the floor, clears the ceiling, and carries the magic, so head-only
+    evidence returned exit 0 / publish: true. Only the trailer check rejects
+    it. The fixture is verified to BE a truncated GIF before the gate is
+    exercised — magic present, trailer absent — because a test that describes
+    truncation while stripping the magic asserts a different predicate than
+    its name claims.
     """
-    bogus = sparse_file(tmp_path, "not-a.gif", 1_500_000, magic=b"")
-    assert BUDGET_FLOOR_BYTES < 1_500_000 < BUDGET_CEILING_BYTES, (
-        "the fixture must sit comfortably inside the publishable size band, "
-        "so only the structural gate can reject it"
+    truncated = assert_fixture_shape(
+        sparse_file(tmp_path, "truncated.gif", 1_500_000, trailer=b""),
+        magic=True, trailer=False, size=1_500_000,
     )
-    proc = run_budget("L0", file=bogus)
+    assert BUDGET_FLOOR_BYTES < 1_500_000 < BUDGET_CEILING_BYTES, (
+        "the fixture must sit inside the publishable size band, so neither "
+        "the floor nor the ceiling can be what rejects it"
+    )
+    proc = run_budget("L0", file=truncated)
     assert proc.returncode == 13, (
-        f"a 1.5 MB non-GIF must fail structurally, not publish: {proc.stdout!r}"
+        f"a 1.5 MB truncated GIF must fail structurally, not publish: {proc.stdout!r}"
     )
     out = json_stdout(proc)
     assert out["publish"] is False
     assert out["reason"] == "structure", (
         "and must not be mislabelled 'floor' — it is nowhere near the floor"
     )
-    assert out["next"] is None, "no ladder descent repairs a malformed file"
+    assert out["next"] is None, "no ladder descent repairs a truncated file"
+
+
+def test_wrong_file_entirely_named_gif_is_rejected(tmp_path):
+    """The other half of the structural class, and a DIFFERENT predicate from
+    truncation: a file that never was a GIF (wrong magic). Caught even by
+    head-only evidence — kept as its own test so the truncation case above is
+    not credited with covering it, or vice versa.
+    """
+    bogus = assert_fixture_shape(
+        sparse_file(tmp_path, "not-a.gif", 1_500_000, magic=b""),
+        magic=False, trailer=True, size=1_500_000,
+    )
+    proc = run_budget("L0", file=bogus)
+    assert proc.returncode == 13, (proc.stdout, proc.stderr)
+    out = json_stdout(proc)
+    assert out["publish"] is False
+    assert out["reason"] == "structure"
+    assert out["next"] is None
 
 
 def test_html_error_page_saved_as_gif_is_rejected(tmp_path):
-    """A failed fetch that wrote an error page to the artifact path."""
+    """A failed fetch that wrote an error page to the artifact path. Wrong
+    magic, not truncation."""
     path = tmp_path / "error.gif"
     path.write_bytes(b"<!DOCTYPE html>\n<html><body>504 Gateway Timeout</body></html>\n"
                      + b"\0" * 100_000)
+    assert_fixture_shape(path, magic=False, trailer=False)
     proc = run_budget("L0", file=path)
     assert proc.returncode == 13
     assert json_stdout(proc)["reason"] == "structure"
 
 
 @pytest.mark.parametrize("rung", LADDER_LEVELS)
-def test_structural_failure_never_descends_the_ladder(rung, tmp_path):
-    bogus = sparse_file(tmp_path, f"bogus-{rung}.gif", 1_500_000, magic=b"")
+@pytest.mark.parametrize(
+    ("kind", "kwargs", "shape"),
+    [
+        ("truncated", {"trailer": b""}, {"magic": True, "trailer": False}),
+        ("wrong-magic", {"magic": b""}, {"magic": False, "trailer": True}),
+    ],
+    ids=["truncated", "wrong-magic"],
+)
+def test_structural_failure_never_descends_the_ladder(rung, kind, kwargs, shape, tmp_path):
+    bogus = assert_fixture_shape(
+        sparse_file(tmp_path, f"{kind}-{rung}.gif", 1_500_000, **kwargs), **shape
+    )
     proc = run_budget(rung, file=bogus)
-    assert proc.returncode == 13, f"{rung} must hard-fail structurally"
+    assert proc.returncode == 13, f"{rung}/{kind} must hard-fail structurally"
     assert json_stdout(proc)["next"] is None
 
 
@@ -374,7 +429,11 @@ def test_the_three_hard_fail_reasons_are_distinct(tmp_path):
     fault); 12 = a well-formed but degenerate clip (palette/pix_fmt fault);
     11 = genuinely oversized. Different first debugging step, so the operator
     must be able to tell them apart from the verdict alone."""
-    structure = run_budget("L0", file=sparse_file(tmp_path, "s.gif", 1_500_000, magic=b""))
+    truncated = assert_fixture_shape(
+        sparse_file(tmp_path, "s.gif", 1_500_000, trailer=b""),
+        magic=True, trailer=False,
+    )
+    structure = run_budget("L0", file=truncated)
     floor = run_budget("L2", size=BUDGET_FLOOR_BYTES)
     ceiling = run_budget("L2", size=BUDGET_CEILING_BYTES + 1)
     codes = (structure.returncode, floor.returncode, ceiling.returncode)
@@ -382,6 +441,87 @@ def test_the_three_hard_fail_reasons_are_distinct(tmp_path):
     reasons = tuple(json_stdout(p)["reason"] for p in (structure, floor, ceiling))
     assert reasons == ("structure", "floor", "ceiling")
     assert len(set(reasons)) == 3
+
+
+# --- Step precedence: the first violated step alone produces the verdict --------
+
+def test_small_truncated_file_is_structural_not_floor(tmp_path):
+    """RE-PIN. Under the head-only predicate this artifact was a floor
+    violation (12) and that was correct. Under the ratified head-and-tail
+    predicate it violates step 1, and step 1 outranks step 2: the verdict is
+    13. Reporting it as 'floor' would send the operator into the palette /
+    pix_fmt path for a problem that is not in the encoder's colour handling.
+    """
+    truncated = assert_fixture_shape(
+        sparse_file(tmp_path, "small-truncated.gif", COLLAPSE_SIGNATURE_BYTES,
+                    trailer=b""),
+        magic=True, trailer=False,
+    )
+    assert COLLAPSE_SIGNATURE_BYTES < BUDGET_FLOOR_BYTES, "fixture is sub-floor"
+    proc = run_budget("L0", file=truncated)
+    assert proc.returncode == 13, "structural violation outranks the floor"
+    assert json_stdout(proc)["reason"] == "structure"
+
+
+def test_artifact_violating_both_structure_and_floor_reports_structure(tmp_path):
+    """SPEC 12.1: a 2.4 KB PNG is both structurally invalid and sub-floor; the
+    verdict is the lowest-numbered violated step, 13, never 12."""
+    png_ish = assert_fixture_shape(
+        sparse_file(tmp_path, "tiny.png", 2_400, magic=b""),
+        magic=False, trailer=True,
+    )
+    assert 2_400 < BUDGET_FLOOR_BYTES
+    proc = run_budget("L0", file=png_ish)
+    assert proc.returncode == 13
+    assert json_stdout(proc)["reason"] == "structure"
+
+
+def test_structurally_valid_sub_floor_file_still_reports_floor(tmp_path):
+    """The precedence rule must not swallow the floor: an artifact that PASSES
+    step 1 and fails step 2 is still a floor violation (12), which is what
+    keeps the palette-collapse diagnosis intact."""
+    collapsed = assert_fixture_shape(
+        sparse_file(tmp_path, "collapsed.gif", COLLAPSE_SIGNATURE_BYTES),
+        magic=True, trailer=True,
+    )
+    proc = run_budget("L0", file=collapsed)
+    assert proc.returncode == 12, "a complete but degenerate clip is a floor fault"
+    assert json_stdout(proc)["reason"] == "floor"
+
+
+# --- --size is a diagnostic entry point, not a publication path -----------------
+
+def test_size_mode_cannot_produce_a_publication_decision(tmp_path):
+    """SPEC 12.1: --size asserts a byte count with no artifact behind it, so
+    step 1 has nothing to read — structural evidence is UNAVAILABLE, not
+    skipped. Publication decisions are made only from --file. This is why
+    --size 0 yields 12 while a 0-byte FILE yields 13: two different questions.
+    """
+    by_size = run_budget("L0", size=0)
+    assert by_size.returncode == 12, "--size asks only 'is this below the floor?'"
+    assert json_stdout(by_size)["reason"] == "floor"
+
+    empty_file = assert_fixture_shape(
+        sparse_file(tmp_path, "empty.gif", 0, magic=b""),
+        magic=False, trailer=False,
+    )
+    by_file = run_budget("L0", file=empty_file)
+    assert by_file.returncode == 13, "--file asks 'is this artifact a GIF?'"
+    assert json_stdout(by_file)["reason"] == "structure"
+    assert by_size.returncode != by_file.returncode, (
+        "the same byte count reaches different verdicts through the two entry "
+        "points, and that is the specified behaviour, not a contradiction"
+    )
+
+
+def test_size_mode_never_reports_a_structural_verdict():
+    """--size can never emit reason 'structure' — it has no artifact to read."""
+    for size in (0, COLLAPSE_SIGNATURE_BYTES, STILL_FRAME_BYTES,
+                 BUDGET_CEILING_BYTES + 1):
+        proc = run_budget("L0", size=size)
+        assert proc.returncode != 13, f"--size {size} must not yield a structural verdict"
+        out = json_stdout(proc)
+        assert out.get("reason") != "structure"
 
 
 def test_a_valid_gif_header_passes_the_structural_gate(tmp_path):
