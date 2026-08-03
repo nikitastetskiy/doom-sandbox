@@ -31,6 +31,8 @@ Quick reference:
 | 7 | Receipts stopped appearing | [7. Receipt degradation](#7-receipt-degradation-under-secondary-rate-limits) |
 | 8 | The README image is stale | [8. Camo PURGE (use sparingly)](#8-camo-purge-use-sparingly) |
 | 9 | Runs are green but moves are bounced with "the arcade is being upgraded" | [9. Sealed section (pin mismatch)](#9-sealed-section-pin-mismatch) |
+| 10 | Runs are green but moves are bounced with "log full" | [10. Section cap (the LOG_FULL screen)](#10-section-cap-the-log_full-screen) |
+| 11 | A run went red at *Encode the GIF* | [11. Publish-gate refusals (exit 11, 12, 13)](#11-publish-gate-refusals-exit-11-12-13) |
 
 ---
 
@@ -69,6 +71,7 @@ Read the failing step name — it maps directly onto a write-contract row:
 |---|---|---|
 | Drain / Apply / Simulate / Encode | pre-push | nothing; best-effort UNAVAILABLE swap |
 | Apply moves — exit 7 | refuse-to-run | nothing → [section 9](#9-sealed-section-pin-mismatch) |
+| Encode the GIF — exit 11 / 12 / 13 | pre-push, publish gate refused | nothing → [section 11](#11-publish-gate-refusals-exit-11-12-13) |
 | Rewrite the README game block | marker validation | nothing at all, swap suppressed → [section 6](#6-marker-repair-the-fail-safe-brick) |
 | Push the game state | push failure | GIF may be on `output`; ledger is not on the default branch |
 | Close issues and post receipts | post-push | everything landed; only receipts failed → [section 7](#7-receipt-degradation-under-secondary-rate-limits) |
@@ -81,6 +84,15 @@ means the drain misbehaved: treat it as a pipeline bug, not an operational
 event. Nothing was written either way. Go to
 [section 9](#9-sealed-section-pin-mismatch), which covers both the normal
 (self-healing) pin-mismatch path and this anomaly.
+
+**A green run that appended nothing is not a failure.** When every move a run
+drained was rejected in band — all sealed-rejected, or all cap-rejected — the run
+**succeeds** with zero ledger appends, no GIF publish, and a display-only swap to
+SEALED or LOG_FULL (SPEC §10, degraded-mode note). The run summary says so
+explicitly under *Degraded mode — this run SUCCEEDED*. Nothing failed and no game
+state was ever eligible to change, so there is nothing to repair:
+[section 9](#9-sealed-section-pin-mismatch) and
+[section 10](#10-section-cap-the-log_full-screen) describe how each clears.
 
 **Recover.** Fix the cause if there is one, then run a normal dispatch
 ([section 2](#2-manual-dispatch-drain-re-render-and-unavailable-recovery)). If
@@ -448,6 +460,219 @@ and it is designed to need no privileged intervention; editing authoritative
 committed state to step around a guard is precisely how a timeline forks. If the
 pins themselves are wrong, fix `game/toolchain.json` (or revert the bump) and let
 a reset roll the section over.
+
+### How the SEALED screen gets there
+
+The workflow selects the screen from `drain.py`'s machine-readable `reason` codes,
+never from the player-visible guidance text — SPEC §5.7 makes the six codes a
+normative closed enum (`applied`, `duplicate`, `grammar`, `cooldown`,
+`section-cap`, `sealed`, mirrored in `game/mapping/v1.json` `reason_codes`) and
+states the rule directly: *no consumer may string-match a player-visible message*.
+Those messages are written for humans and may be reworded; the codes may not.
+
+When a run drains at least one move and appends none of them, the `work` step
+sets `all_rejected=true` and picks `state_screen=SEALED` (a `sealed` code present)
+or `LOG_FULL` (a `section-cap` code present); the *Swap in the SEALED or LOG_FULL
+guidance screen* step then rewrites the README block and pushes it. The run stays
+green throughout. A code outside the enum fails the run loudly rather than being
+counted as some seventh outcome — per §5.7 that is a drain defect, not a new state.
+
+**Residual worth knowing (§0).** The swap is witnessed by *rejections*, so it fires
+only on a run that actually drained a move. SPEC §5.5 rule 7 treats three cases
+alike — an all-sealed-reject batch, an all-duplicate batch, and a batch with
+nothing admissible — but only the first emits a `sealed` code. A section that is
+sealed while **nobody is submitting moves** therefore will not swap the screen in
+on the idle sweep; it swaps on the next run that drains a real move, which is also
+the next moment a player is there to see it. Closing that gap needs a top-level
+"this section is sealed" flag in the drain's JSON output; re-deriving the pin
+comparison in the workflow is exactly what §5.7 and §0 forbid, so it is not done.
+If you need the screen up *now* on a quiet game, push it by hand (below).
+
+**The swap is best effort, exactly like the UNAVAILABLE swap.** Its push can lose
+a race with another writer, and it carries `continue-on-error: true` because
+turning a spec-defined *success* red over a cosmetic push would also trip the
+sweep's consecutive-failure alert. If the run summary shows
+`swap outcome: failure`, the issues were still closed correctly and the ledger is
+still right — only the displayed screen is stale. Force it by hand:
+
+```sh
+python3 game/scripts/rewrite_readme.py \
+  --readme README.md --mapping game/mapping/v1.json \
+  --state SEALED \
+  --image-url "game/assets/screens/sealed.png"
+git add -- README.md && git commit -m 'chore(doom): show the sealed screen' && git push
+```
+
+Or just dispatch a run ([section 2](#2-manual-dispatch-drain-re-render-and-unavailable-recovery)) —
+but note that only works while moves are still arriving: the swap fires off a
+*drained batch*, so a run with nothing pending swaps nothing.
+
+---
+
+## 10. Section cap (the LOG_FULL screen)
+
+**Symptom.** Runs are **green**, but every move comes back closed with
+`log full — start a new game`, the README shows the LOG_FULL screen, the ledger
+stops growing and no new GIF is published.
+
+**This is the cap working, not a fault.** A section stops accepting
+frame-contributing moves once its accumulated frames reach
+`knobs.section_cap_frames` in `game/mapping/v1.json`. It is the same in-band
+rejection mechanic as a sealed section ([section 9](#9-sealed-section-pin-mismatch))
+and it takes the same recovery: `doom: new game` contributes zero frames, closes
+the full section and opens a fresh empty one.
+
+The two are distinguishable and never ambiguous — the section cap is about
+**length**, sealing is about **toolchain pins**:
+
+| | LOG_FULL | SEALED |
+|---|---|---|
+| Cause | the section hit its frame cap | a header pin no longer matches the running toolchain |
+| Drain reason code | `section-cap` | `sealed` |
+| Player message | `log full — start a new game` | `the arcade is being upgraded — press New game to continue` |
+| `new game` cooldown | **applies** (30 min) | **does not apply** (§5.5 rule 6) |
+| Clears by | `doom: new game` | `doom: new game` |
+
+**Confirm that is what you are looking at:**
+
+```sh
+# Frames accumulated in the current section vs. the cap.
+jq -r '.knobs.section_cap_frames' game/mapping/v1.json
+python3 - <<'PY'
+import json, pathlib, sys
+sys.path.insert(0, "game/scripts")
+import gamelog
+mapping = gamelog.load_mapping(pathlib.Path("game/mapping/v1.json"))
+log = gamelog.parse_log(pathlib.Path("game/state/log.txt").read_text(), mapping)
+frames = gamelog.token_frames(mapping)
+current = log.sections[-1]
+print("current section frames:", sum(frames.get(e.token, 0) * e.count for e in current.entries))
+PY
+```
+
+**No operator action is required** — the first `doom: new game` a player submits
+clears it. Unlike sealing, the 30-minute cooldown **does** apply here, so a reset
+submitted within 30 minutes of the previous one is itself rejected; that is
+anti-grief behaviour on a live game, not a fault. To clear it yourself, submit an
+ordinary reset:
+
+```sh
+gh issue create --repo "$REPO" --title 'doom: new game' --body 'Rolling the section over at the cap.'
+```
+
+---
+
+## 11. Publish-gate refusals (exit 11, 12, 13)
+
+**Symptom.** A run went red at *Encode the GIF through the budget ladder*. The
+run summary carries a `### Refused: …` block naming the exit code.
+
+All three are **pre-push** failures: the ledger, the stream and the `output`
+branch are byte-untouched, every drained move is still an open issue, and the
+best-effort UNAVAILABLE swap fires. There is no state to repair. What differs is
+**where you look first** — which is the entire reason SPEC §12.1 spends separate
+integers on them instead of one generic "the encode failed".
+
+| Exit | Verdict | What it means | Ladder descent | Look at |
+|---|---|---|---|---|
+| 11 | `ceiling` | A complete GIF that is still over 4,000,000 bytes at the **last** ladder rung — there is nothing smaller left to try | exhausted | the ladder constants in `game/mapping/v1.json` vs. the measured encode rate in `game/toolchain.json` |
+| 12 | `floor` | **The encode collapsed.** The artifact *is* a complete GIF — it is just far too small to be a real clip (at or below `budget.floor_bytes`, 16,000) | **no** — a smaller re-encode makes a collapse smaller, not better | the palette path: the pinned `-pix_fmt bgr0` on the rawvideo input, and the rung's filtergraph in `game/toolchain.json` |
+| 13 | `structure` | **The artifact is not the complete output of a GIF writer.** Either it is the wrong *kind* of file (a PNG, an HTML error page saved under a `.gif` name), or the encoder **started a GIF and did not finish it** — a truncated write | **no** — a re-encode cannot complete a file the encoder abandoned | the encoder itself: the pinned ffmpeg binary, its `-f gif` output, whether the rawvideo pipe carried frames, and whether the runner ran out of disk mid-write |
+
+**12 and 13 are not degrees of the same problem.** 12 says *the encoder ran to
+completion and the GIF it produced is wrong* — a palette or `pix_fmt` fault, and
+the first suspect is the `bgra` / `bgr0` trap that silently renders every pixel
+transparent. 13 says *what came out is not a finished GIF*, which points at the
+encoder, the pipe, or the runner rather than at the encode recipe. Size is
+irrelevant to 13 and central to 12; conflating them sends you to the wrong file.
+
+**Step precedence: the first violated step alone produces the verdict.** An
+artifact can violate more than one — a 2,470-byte PNG is both structurally
+invalid *and* sub-floor — and the answer is always the lowest-numbered violation,
+so that case is **13, never 12**. This is not a tie-break convenience: a non-GIF's
+byte count is a property of the wrong file, and reporting it as a floor violation
+would send you into the palette path for a fault that is not in the encoder's
+colour handling. Size is only a meaningful question once the artifact is
+established to be a GIF at all.
+
+> **What exit 13 establishes, and what it leaves open.** The check is
+> **head and tail**: the file is non-empty, **begins** with the `GIF89a` magic
+> (bytes 0–5) and **ends** with the GIF trailer byte `0x3B`. The magic proves a
+> GIF writer *started*; the trailer is the last byte the muxer emits, so it proves
+> one *finished*. Two seeks, seven bytes, no decoder. Both constants are read at
+> runtime from `game/mapping/v1.json` (`budget.structure.magic_hex`,
+> `budget.structure.trailer_hex`), so they are authored once.
+>
+> This **does** catch truncation, which head-only evidence structurally could not
+> — truncation removes bytes from the end, and the magic lives at the start. It
+> does **not** prove the block chain between the two ends is intact. Per SPEC §0,
+> the residual is stated rather than implied:
+>
+> - **truncation at an offset that happens to hold a `0x3B` byte** still passes —
+>   measured at ~0.3 % of offsets in a reference L0 artifact (2,064 in 705,961
+>   bytes). That narrows the hole by roughly two orders of magnitude; it does not
+>   close it;
+> - **corruption strictly between head and tail** — damaged or interleaved blocks
+>   with both ends intact — is not covered. Walking the block chain would put a
+>   decoder dependency inside the publish gate, judged disproportionate for a
+>   corruption mode this pipeline has never produced;
+> - **a structurally complete but visually degenerate GIF** (palette collapse) is
+>   deliberately not step 1's job — that is size-detectable and belongs to the
+>   floor (exit 12).
+>
+> So: a green publish gate is good evidence that the encoder finished, and it is
+> **not** a guarantee that the GIF is valid. Per §12.1's standing lesson, a clean
+> exit code remains the weakest available evidence.
+
+**Diagnose.**
+
+```sh
+# The refusal block names the verdict, the size, and the constant it was compared to.
+gh run view <run-id> --repo "$REPO" --log-failed | grep -E '^\{"rung"|::error::'
+```
+
+The gate emits a machine-readable verdict on stdout before it exits, which the
+workflow echoes into the log:
+
+```json
+{"rung": "L0", "ceiling": 4000000, "floor": 16000, "publish": false,
+ "size": 106, "hard_fail": true, "next": null, "reason": "floor"}
+```
+
+**Reproduce locally** against any artifact, without the pipeline:
+
+```sh
+python3 game/scripts/budget.py --mapping game/mapping/v1.json --rung L0 --file <path>
+echo "exit: $?"   # 0 publish / 10 re-encode / 11 ceiling / 12 floor / 13 structure
+```
+
+`--size` substitutes a byte count for a real file, which is the quick way to check
+ladder arithmetic without encoding anything. Three things to keep straight:
+
+- **`--size` is never a publication path.** With no artifact behind it, step 1 has
+  nothing to read, so structural evidence there is not *skipped* — it is
+  unavailable, and a gate that cannot establish its property has not passed it.
+  Its exit code is a **size verdict only**. This is why `--size 0` yields **12**
+  while a 0-byte *file* yields **13**: two different questions, not a
+  contradiction. The workflow's publish step passes `--file` and must keep doing so.
+- **The floor is exclusive** (`size > floor` to publish) while the **ceiling is
+  inclusive** (`size <= ceiling`). The asymmetry is deliberate.
+- **A nonexistent `--file` is a usage error (exit 2)**, not an artifact verdict — a
+  malformed invocation is not a malformed artifact.
+
+**Recover.** Fix the cause, then dispatch a run
+([section 2](#2-manual-dispatch-drain-re-render-and-unavailable-recovery)). If the
+cause was transient, the next sweep drains the backlog within 6 hours.
+
+**Where the predicate lives.** In exactly one place: `game/scripts/budget.py`,
+reading its constants from `game/mapping/v1.json`. The workflow does **not**
+re-implement it. It used to — a `head -c 6` test in `doom.yml` under a comment
+claiming it caught "a 0-byte or truncated GIF" while reading no byte past offset
+5 — and that copy was logged as failure instance five in SPEC §12.1. Re-typing a
+normative predicate into shell, in a file with no unit tests, is how the same hole
+came to exist in two places at once. What the workflow keeps is the *diagnosis*:
+the `### Refused: …` summary blocks. If you are tempted to add a "quick check"
+before the gate, don't — extend the gate.
 
 ---
 

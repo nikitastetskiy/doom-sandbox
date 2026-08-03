@@ -179,6 +179,14 @@ jobs:
       # needs the buster (D5/D10).
       SCREEN_PAUSED: game/assets/screens/paused.png
       SCREEN_UNAVAILABLE: game/assets/screens/unavailable.png
+      # The two in-band guidance screens (SPEC section 11). Neither is a
+      # failure display: a run that shows one of these SUCCEEDED - it drained,
+      # it rejected in band, it closed the rejected issues with their fixed
+      # guidance message, and it had zero ledger appends to make (SPEC section
+      # 10, degraded-mode note). Which one is selected off drain.py's `sealed`
+      # and `section-cap` reason codes - never off the player-visible prose.
+      SCREEN_LOG_FULL: game/assets/screens/log-full.png
+      SCREEN_SEALED: game/assets/screens/sealed.png
     steps:
       - name: Checkout game state
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -365,11 +373,110 @@ jobs:
           moves=false
           if [ -s "${RUNNER_TEMP}/moves.txt" ]; then moves=true; fi
           closes="$(jq -r '.post_push | length > 0' "${RUNNER_TEMP}/actions.json")"
+
+          # --- the degraded-mode outputs (SPEC section 10, degraded-mode note) --
+          #
+          # Everything below reads drain.py's machine-readable `reason` field
+          # and nothing else. SPEC 5.7 makes the six codes a normative CLOSED
+          # enum, mirrored in mapping `reason_codes`, and states the consumer
+          # rule directly: no consumer may string-match a player-visible
+          # message. Those are written for humans and may be reworded; the
+          # codes may not. So nothing here matches prose, and the enum is read
+          # from the mapping rather than retyped into YAML.
+          #
+          # SPEC 5.7: "a drained issue that matches no row is a bug, not a
+          # seventh outcome". Fail loudly on one rather than let it fall through
+          # the arithmetic below, where an unrecognized code would silently
+          # count as a rejection and could swap in the wrong screen.
+          # tojson, not the bare value: an entry with NO `reason` field at all
+          # yields null, and `join` renders null as the empty string - which
+          # would leave $unknown empty and wave the defect straight through the
+          # guard meant to catch it. tojson renders it as the literal `null`,
+          # so a missing code is reported instead of silently admitted.
+          unknown="$(jq -r --slurpfile m "${MAPPING}" \
+            '[.post_push[].reason | select(. as $r | ($m[0].reason_codes | index($r)) == null)]
+             | unique | map(tojson) | join(", ")' \
+            "${RUNNER_TEMP}/actions.json")"
+          if [ -n "$unknown" ]; then
+            echo "::error::the drain emitted reason code(s) outside the SPEC 5.7 closed enum: ${unknown}. That is a defect in the drain, not a seventh outcome - refusing to act on the plan."
+            exit 1
+          fi
+          #
+          # "Drained" excludes `duplicate`: an issue whose number is already in
+          # the ledger is close-only cleanup. It never consumed the per-run cap
+          # and was never a candidate for this run, so counting it would make a
+          # pure cleanup sweep look like a rejected batch.
+          drained="$(jq -r '[.post_push[] | select(.reason != "duplicate")] | length' "${RUNNER_TEMP}/actions.json")"
+          applied="$(jq -r '[.post_push[] | select(.reason == "applied")] | length' "${RUNNER_TEMP}/actions.json")"
+
+          # The two tables must agree by construction - `applied` is the only
+          # reason that yields a ledger line. A disagreement means either the
+          # close plan or the ledger batch is wrong, and acting on either would
+          # close issues that never reached the ledger (the D14 lost-move
+          # failure) or swap the wrong screen. Fail here, pre-push: nothing is
+          # written, the moves stay open, the next run re-drains them.
+          ledger_lines=0
+          if [ -s "${RUNNER_TEMP}/moves.txt" ]; then
+            ledger_lines="$(wc -l < "${RUNNER_TEMP}/moves.txt" | tr -d ' ')"
+          fi
+          if [ "$ledger_lines" -ne "$applied" ]; then
+            echo "::error::the drain emitted ${ledger_lines} ledger line(s) but ${applied} 'applied' close(s) - the plan and the batch disagree, refusing to act on either"
+            exit 1
+          fi
+
+          # all_rejected: at least one move was drained and not one of them was
+          # applied. This is a SUCCESS condition, not a failure - see the swap
+          # step and the run summary below.
+          #
+          # Stated as SPEC 0 requires, so this signal is not a third gate
+          # specified against its motivating instance:
+          #   property established - "this run drained work and appended no
+          #     ledger line", which is the observable half of SPEC 5.5 rule 7's
+          #     governing property ("no frame-contributing line landed"). It is
+          #     the stricter of the two and that is the safe direction: if a
+          #     reset DID land, the section is no longer sealed and no guidance
+          #     screen should be shown.
+          #   evidence read - the reason codes in the drain's own action plan,
+          #     validated above against the mapping's closed enum.
+          #   residual NOT covered - rule 7 unifies three cases, and the reason
+          #     codes can only witness the one that carries a rejection. A batch
+          #     that is entirely `duplicate`, and a run with no pending input at
+          #     all, are the same case under rule 7 but emit no `sealed` code,
+          #     so a section that is sealed while nobody is submitting new moves
+          #     will not swap in SEALED here. Closing that needs a top-level
+          #     "this section is sealed" flag from drain.py, which owns
+          #     section_is_sealed(); re-deriving the pin comparison in YAML is
+          #     exactly what SPEC 5.7 and SPEC 0 forbid, so it is not done here.
+          #     Consequence is bounded: the swap fires on the next run that
+          #     drains a real move, which is also the next moment a player can
+          #     observe the screen.
+          all_rejected=false
+          # state_screen: which SPEC section 11 guidance screen the swap shows,
+          # empty when none applies. A batch rejected only for `grammar` or
+          # `cooldown` is still a live game with an accurate frame on display,
+          # so it swaps nothing.
+          state_screen=''
+          if [ "$drained" -gt 0 ] && [ "$applied" -eq 0 ]; then
+            all_rejected=true
+            # `sealed` wins where both appear. They are in fact mutually
+            # exclusive whenever applied == 0: only an applied `new game` can
+            # clear the sealed flag mid-batch, and that reset is itself a
+            # ledger line. The ordering is defensive, matching drain.py, which
+            # tests `sealed` before the section cap.
+            if [ "$(jq -r 'any(.post_push[].reason; . == "sealed")' "${RUNNER_TEMP}/actions.json")" = true ]; then
+              state_screen=SEALED
+            elif [ "$(jq -r 'any(.post_push[].reason; . == "section-cap")' "${RUNNER_TEMP}/actions.json")" = true ]; then
+              state_screen=LOG_FULL
+            fi
+          fi
+
           {
             echo "moves=${moves}"
             echo "closes=${closes}"
+            echo "all_rejected=${all_rejected}"
+            echo "state_screen=${state_screen}"
           } >> "$GITHUB_OUTPUT"
-          echo "moves=${moves} closes=${closes}"
+          echo "moves=${moves} closes=${closes} drained=${drained} applied=${applied} all_rejected=${all_rejected} state_screen=${state_screen:-none}"
 
       # --- render: toolchain, apply, simulate, encode ------------------------
 
@@ -551,7 +658,70 @@ jobs:
         run: |
           set -euo pipefail
           gif="${RUNNER_TEMP}/doom.gif"
+          verdict="${RUNNER_TEMP}/budget.json"
           published=false
+
+          # SPEC 12.1 spends two integers on 12 and 13 because they send an
+          # operator to two different places on the very first debugging step.
+          # Collapsing them into one generic "budget.py failed" row throws away
+          # precisely the distinction the section exists to create, so each gets
+          # its own summary block and its own ::error:: line.
+          #
+          #   13 = the artifact is not the complete output of a GIF writer -
+          #        wrong file type, empty, or truncated. A pipeline or toolchain
+          #        fault. Size is irrelevant: a large non-GIF and a large
+          #        truncated GIF both clear the floor and the ceiling.
+          #   12 = the artifact IS a complete GIF that came out degenerate - the
+          #        encode collapsed. A palette or pix_fmt fault.
+          #
+          # Neither descends the ladder: a smaller re-encode cannot change a
+          # file's type, and it cannot repair a collapse either.
+          #
+          # THIS STEP DOES NOT IMPLEMENT THE STRUCTURAL PREDICATE. SPEC 12.1
+          # step 1 is head AND tail - the GIF89a magic proves a writer started,
+          # the 0x3B trailer proves one finished - with both constants read at
+          # runtime from mapping budget.structure. budget.py owns that predicate
+          # and enforces it unconditionally; it is unit-tested and it reads the
+          # constants from the one place they are authored.
+          #
+          # A bash re-implementation here was removed deliberately. SPEC 0 is
+          # explicit that a gate specified against its motivating instance drifts
+          # from the class it must cover, and the copy that used to live here is
+          # instance five: it tested `head -c 6` under a comment claiming it
+          # caught "a 0-byte or truncated GIF" while reading no byte past offset
+          # 5. Re-typing a normative predicate into YAML - in a language with no
+          # test coverage, against constants it would have to re-read itself - is
+          # how that hole came to exist in two places at once. What the workflow
+          # keeps is the DIAGNOSIS (the summary block below), which is where
+          # "logs better" actually lives; the PREDICATE stays in one place.
+          structural_failure() {
+            rung_at="$1"
+            reported_size="$2"
+            {
+              echo "### Refused: the artifact is not a complete GIF (exit 13, structural)"
+              echo ""
+              echo "\`${rung_at}\` produced a file that does not carry both ends a GIF writer"
+              echo "leaves behind: the \`GIF89a\` magic at the head and the \`0x3B\` trailer at"
+              echo "the tail. Either the encoder emitted **the wrong kind of file**, or it"
+              echo "**started writing a GIF and did not finish** - so this is a pipeline or"
+              echo "toolchain fault, and size is not the question: a large non-GIF and a large"
+              echo "truncated GIF both clear the floor and the ceiling."
+              echo ""
+              echo "| field | value |"
+              echo "| --- | --- |"
+              echo "| verdict | structural (exit 13) |"
+              echo "| size | ${reported_size} bytes |"
+              echo "| ladder descent | no - a re-encode cannot complete a file the encoder abandoned |"
+              echo "| first thing to check | the encoder and its pipe: the pinned ffmpeg binary, its \`-f gif\` output, whether the rawvideo stdin carried frames at all, and whether the runner ran out of disk mid-write |"
+              echo ""
+              echo "Nothing was published: the ledger, the stream and the \`output\` branch are"
+              echo "byte-untouched and every drained move is still an open issue. This is the"
+              echo "pre-push row of the write contract (SPEC section 10)."
+              echo "See game/RUNBOOK.md section 11."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "budget-failure=structure" >> "$GITHUB_OUTPUT"
+            echo "::error::exit 13 - ${rung_at} produced an artifact that is not a complete GIF (${reported_size} bytes); nothing is published. Wrong file type or an unfinished write, not a size problem. See the run summary and game/RUNBOOK.md section 11."
+          }
 
           for rung in $(jq -r '.budget.ladder[].level' "${MAPPING}"); do
             tail_seconds="$(jq -r --arg r "$rung" '.budget.ladder[] | select(.level == $r) | .tail_seconds' "${MAPPING}")"
@@ -568,24 +738,89 @@ jobs:
                   -f rawvideo -framerate "${FPS}" -s "${WIDTH}x${HEIGHT}" -pix_fmt bgr0 -i - \
                   -filter_complex "$graph" -loop 0 -f gif "$gif"
 
-            # budget.py is a ceiling check, so a degenerate encode passes it:
-            # a 0-byte or truncated GIF is trivially under 4,000,000 bytes and
-            # would publish clean. Assert the file is structurally a GIF before
-            # asking whether it fits. (A silent palette collapse still produces
-            # a well-formed small GIF - that one is prevented upstream by the
-            # pinned -pix_fmt bgr0 and caught by the sandbox rehearsal.)
-            if [ ! -s "$gif" ] || [ "$(head -c 6 "$gif")" != "GIF89a" ]; then
-              echo "::error::${rung} produced no usable GIF - the encode failed structurally, nothing is published"
+            # Orchestration check, NOT the structural gate: did the subprocess
+            # this step just ran leave a file behind at all? budget.py treats a
+            # missing --file as a usage error (exit 2) on purpose - SPEC 12.1
+            # calls that a malformed *invocation*, not a malformed *artifact* -
+            # so catching it here keeps a vanished output from surfacing as a
+            # confusing usage verdict. Existence only: emptiness and content are
+            # the gate's business, and this must never grow into a second copy
+            # of the predicate.
+            if [ ! -e "$gif" ]; then
+              echo "::error::${rung}: ffmpeg exited 0 but wrote no output file - nothing is published"
               exit 1
             fi
 
+            # The verdict JSON is the machine-readable channel (SPEC 12.1):
+            # hard_fail / next / reason / size / floor / ceiling. Branch on the
+            # exit code, report from the JSON - so no normative number (the
+            # floor, the ceiling) is ever retyped into this file.
             rc=0
-            python3 game/scripts/budget.py --mapping "${MAPPING}" --rung "$rung" --file "$gif" || rc=$?
+            python3 game/scripts/budget.py --mapping "${MAPPING}" --rung "$rung" --file "$gif" > "$verdict" || rc=$?
+            cat "$verdict" || true
             case "$rc" in
               0)  published=true; echo "rung=${rung}" >> "$GITHUB_OUTPUT"; break ;;
               10) echo "::notice::${rung} exceeds the ceiling - re-encoding at the next rung" ;;
-              11) echo "::error::the GIF exceeds the 4,000,000-byte ceiling at the last ladder rung - nothing is published"; exit 1 ;;
-              *)  echo "::error::budget.py failed with exit ${rc}"; exit 1 ;;
+              11)
+                ceiling="$(jq -r '.ceiling' "$verdict")"
+                size="$(jq -r '.size' "$verdict")"
+                {
+                  echo "### Refused: over the ceiling at the last ladder rung (exit 11)"
+                  echo ""
+                  echo "| field | value |"
+                  echo "| --- | --- |"
+                  echo "| verdict | ceiling (exit 11) |"
+                  echo "| size | ${size} bytes |"
+                  echo "| ceiling | ${ceiling} bytes |"
+                  echo "| rung | \`${rung}\` (the last one - there is nothing smaller to descend to) |"
+                  echo "| first thing to check | the ladder constants in \`game/mapping/v1.json\` against the measured encode rate in \`game/toolchain.json\` |"
+                  echo ""
+                  echo "Nothing was published. See game/RUNBOOK.md section 11."
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "budget-failure=ceiling" >> "$GITHUB_OUTPUT"
+                echo "::error::exit 11 - the GIF still exceeds the ceiling at the last ladder rung; nothing is published. See game/RUNBOOK.md section 11."
+                exit 1 ;;
+              12)
+                floor="$(jq -r '.floor' "$verdict")"
+                size="$(jq -r '.size' "$verdict")"
+                {
+                  echo "### Refused: the encode collapsed (exit 12, below the publish floor)"
+                  echo ""
+                  echo "\`${rung}\` produced a **well-formed GIF that came out degenerate**. The"
+                  echo "file is a real GIF - it is just far too small to be a real clip, which"
+                  echo "is evidence that the encode is broken rather than mis-tuned. Distinct"
+                  echo "from exit 13, where the artifact is not a GIF at all."
+                  echo ""
+                  echo "| field | value |"
+                  echo "| --- | --- |"
+                  echo "| verdict | floor (exit 12) |"
+                  echo "| size | ${size} bytes |"
+                  echo "| floor | ${floor} bytes (exclusive - at or below it is a hard fail) |"
+                  echo "| ladder descent | no - a smaller re-encode makes a collapse smaller, not better |"
+                  echo "| first thing to check | the palette path: the pinned \`-pix_fmt bgr0\` on the rawvideo input and the rung's filtergraph in \`game/toolchain.json\` |"
+                  echo ""
+                  echo "Nothing was published: the ledger, the stream and the \`output\` branch are"
+                  echo "byte-untouched and every drained move is still an open issue. This is the"
+                  echo "pre-push row of the write contract (SPEC section 10)."
+                  echo "See game/RUNBOOK.md section 11."
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "budget-failure=floor" >> "$GITHUB_OUTPUT"
+                echo "::error::exit 12 - ${rung} produced a well-formed but degenerate GIF (${size} bytes, at or below the ${floor}-byte floor); nothing is published. A palette/pix_fmt fault, not a wrong file. See the run summary and game/RUNBOOK.md section 11."
+                exit 1 ;;
+              13)
+                # The sole structural detection path. SPEC 12.1 step precedence:
+                # the first violated step alone produces the verdict, so a
+                # malformed sub-floor artifact (a 2.4 KB PNG) lands here as 13
+                # and never as 12 - a non-GIF's byte count is a property of the
+                # wrong file, and reporting it as a floor violation would send
+                # the operator into the palette path for a fault that is not in
+                # the encoder's colour handling.
+                structural_failure "$rung" "$(jq -r '.size' "$verdict")"
+                exit 1 ;;
+              *)
+                echo "budget-failure=unexpected" >> "$GITHUB_OUTPUT"
+                echo "::error::budget.py failed with exit ${rc}, which is outside its documented taxonomy (0/2/10/11/12/13) - treat this as a defect in the gate itself, not as a verdict about the artifact"
+                exit 1 ;;
             esac
           done
 
@@ -687,6 +922,57 @@ jobs:
 
           [ "$pushed" = true ] || { echo "::error::the game-state push failed after ${attempts} attempts"; exit 1; }
 
+      - name: Swap in the SEALED or LOG_FULL guidance screen
+        id: state_swap
+        # SPEC section 10, degraded-mode note, and SPEC 5.5 rule 7: a run whose
+        # drained moves were ALL rejected in band is a SUCCESS with zero ledger
+        # appends, no GIF publish, and a display-only swap. It is not a failure
+        # row of the write contract - nothing failed, and no game state was
+        # ever eligible to change. Nothing here may make the run red, and the
+        # summary must not let it read as an error.
+        #
+        # Keyed on drain.py's reason codes via the `work` step, never on the
+        # player-visible guidance prose (which is normative text owned by the
+        # SPEC, not a protocol) and never on a re-derived YAML constant.
+        #
+        # Placed before the closes on purpose: the push-then-close ordering is
+        # the same discipline the drain plan is built around.
+        if: >-
+          steps.work.outputs.all_rejected == 'true'
+          && steps.work.outputs.state_screen != ''
+          && env.DRY_RUN != 'true'
+        # Display-only and best effort, exactly like the UNAVAILABLE swap: this
+        # push can lose a race with another writer, and turning a spec-defined
+        # SUCCESS red over a cosmetic push would also trip the sweep's
+        # consecutive-failure alert. The closes below must still run.
+        continue-on-error: true
+        env:
+          # Workflow-generated, but it travels through env like everything
+          # else: this file has no `${{ ... }}` inside any run block, and the
+          # invariant stays uniform and greppable.
+          STATE_SCREEN: ${{ steps.work.outputs.state_screen }}
+        run: |
+          set -euo pipefail
+          controls=()
+          if [ "${CONTROLS_ENABLED}" = "true" ]; then controls=(--controls-enabled); fi
+
+          # The `if:` above is a prefilter only - Actions expression comparison
+          # folds case, so this case statement is the authoritative match.
+          case "${STATE_SCREEN}" in
+            SEALED)   image="${SCREEN_SEALED}" ;;
+            LOG_FULL) image="${SCREEN_LOG_FULL}" ;;
+            *) echo "::error::unknown state screen '${STATE_SCREEN}' - refusing to render an unmapped state"; exit 1 ;;
+          esac
+
+          python3 game/scripts/rewrite_readme.py --readme README.md --mapping "${MAPPING}" \
+            --state "${STATE_SCREEN}" "${controls[@]}" \
+            --image-url "$image"
+          git add -- README.md
+          # Already showing this screen from a previous run: nothing to push,
+          # and re-running is a no-op by design (the rewriter is idempotent).
+          git commit -q -m "chore(doom): show the ${STATE_SCREEN} screen (run ${GITHUB_RUN_ID})" || exit 0
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
       - name: Close issues and post receipts
         id: post_push
         if: steps.work.outputs.closes == 'true' && env.DRY_RUN != 'true' && (steps.push_state.outcome == 'success' || steps.work.outputs.moves != 'true')
@@ -755,10 +1041,18 @@ jobs:
       # --- sweep tail and the failure-path write contract --------------------
 
       - name: Show PAUSED after inactivity
+        # `all_rejected` is excluded, and it is reachable here: idleness is
+        # measured from the last game-state COMMIT, and a section that has been
+        # sealed (or capped) for IDLE_PAUSE_DAYS keeps drawing moves that are
+        # rejected in band without ever appending to the ledger. In that state
+        # the game is not idle - it is being played and answered - so PAUSED
+        # would be a lie, and it would silently overwrite the SEALED/LOG_FULL
+        # screen this same run just pushed. The guidance screen wins.
         if: >-
           github.event_name == 'schedule'
           && steps.guard.outputs.idle == 'true'
           && steps.work.outputs.moves != 'true'
+          && steps.work.outputs.all_rejected != 'true'
         run: |
           set -euo pipefail
           controls=()
@@ -785,6 +1079,10 @@ jobs:
         #     LIVE frame is never overwritten by a failed close or receipt),
         #   - post-push failure on a close-only run (no game state was eligible
         #     to change, so the displayed frame is still accurate),
+        #   - a landed SEALED/LOG_FULL swap (state_swap succeeded: the guidance
+        #     screen is the accurate display and moves ARE being processed, so
+        #     "moves are not being processed right now" would be a downgrade to
+        #     a strictly less true statement),
         #   - runner loss / cancelation, where no step runs at all.
         #
         # Suppression keys off WHICH step failed, not off whether there were
@@ -796,6 +1094,7 @@ jobs:
           failure()
           && steps.rewrite.outcome != 'failure'
           && steps.push_state.outcome != 'success'
+          && steps.state_swap.outcome != 'success'
           && steps.post_push.outcome != 'failure'
           && env.DRY_RUN != 'true'
         continue-on-error: true
@@ -829,6 +1128,13 @@ jobs:
           CLOSES: ${{ steps.work.outputs.closes || 'n/a' }}
           RUNG: ${{ steps.encode.outputs.rung || 'n/a' }}
           PIN_MISMATCH: ${{ steps.apply.outputs.pin-mismatch || 'false' }}
+          ALL_REJECTED: ${{ steps.work.outputs.all_rejected || 'false' }}
+          STATE_SCREEN: ${{ steps.work.outputs.state_screen || 'none' }}
+          # `none` = the gate never returned a hard verdict, which includes the
+          # case where it was never reached. It is NOT an assertion that the
+          # artifact was good.
+          BUDGET_FAILURE: ${{ steps.encode.outputs.budget-failure || 'none' }}
+          SWAP_OUTCOME: ${{ steps.state_swap.outcome || 'skipped' }}
         run: |
           set -euo pipefail
           {
@@ -842,4 +1148,53 @@ jobs:
             echo "| post-push actions | ${CLOSES} |"
             echo "| ladder rung | ${RUNG} |"
             echo "| determinism pin mismatch | ${PIN_MISMATCH} |"
+            echo "| all drained moves rejected | ${ALL_REJECTED} |"
+            echo "| state screen | ${STATE_SCREEN} |"
+            echo "| publish-gate verdict | ${BUDGET_FAILURE} |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # SPEC section 10, degraded-mode note. Say plainly that this run
+          # succeeded: a green run with an empty ledger diff and no GIF is
+          # otherwise indistinguishable at a glance from a run that quietly did
+          # nothing, and an operator who reads it as a failure will go looking
+          # for a fault that does not exist.
+          #
+          # The narrative is keyed on the STATE SCREEN, not on all_rejected.
+          # The two are not the same set: a batch rejected only for `grammar`
+          # or `cooldown` is also "all rejected", but it is ordinary operation
+          # on a live game with an accurate frame on display - calling it
+          # degraded mode, or claiming a swap that did not happen, would be
+          # false.
+          if [ "${STATE_SCREEN}" = "SEALED" ] || [ "${STATE_SCREEN}" = "LOG_FULL" ]; then
+            {
+              echo ""
+              echo "#### Degraded mode - this run SUCCEEDED"
+              echo ""
+              echo "Every move this run drained was rejected in band, so there was nothing to"
+              echo "append and nothing to publish. That is the defined outcome (SPEC section 10,"
+              echo "degraded-mode note), not a fault:"
+              echo ""
+              echo "- zero ledger appends, no GIF encode, no \`output\` push - none were eligible;"
+              echo "- the rejected issues were closed with their fixed guidance message;"
+              echo "- the README game block was swapped to \`${STATE_SCREEN}\` (swap outcome: ${SWAP_OUTCOME})."
+              echo ""
+              if [ "${STATE_SCREEN}" = "SEALED" ]; then
+                echo "The current section is **sealed**: its header pins no longer match the running"
+                echo "toolchain, so only \`doom: new game\` is admissible."
+              else
+                echo "The current section is at its frame cap, so only \`doom: new game\` is"
+                echo "admissible."
+              fi
+              echo "It clears itself the first time a player submits one - **no operator action is"
+              echo "required**. See game/RUNBOOK.md section 9."
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${ALL_REJECTED}" = "true" ]; then
+            {
+              echo ""
+              echo "#### This run SUCCEEDED with nothing to apply"
+              echo ""
+              echo "Every move this run drained was declined by the parser or the cooldown, so"
+              echo "there was nothing to append and nothing to publish. The game is live and the"
+              echo "displayed frame is current - no state screen applies and none was swapped in."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
