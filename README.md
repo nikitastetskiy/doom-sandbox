@@ -26,7 +26,7 @@
 <!-- DOOM:START -->
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/nikitastetskiy/doom-sandbox/output/doom.gif?run=30847672283" alt="DOOM (LIVE)" />
+  <img src="https://raw.githubusercontent.com/nikitastetskiy/doom-sandbox/output/doom.gif?run=30847742493" alt="DOOM (LIVE)" />
 </p>
 
 | | | |
