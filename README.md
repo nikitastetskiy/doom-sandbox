@@ -26,7 +26,7 @@
 <!-- DOOM:START -->
 
 <p align="center">
-  <img src="game/assets/screens/sealed.png" alt="DOOM (SEALED)" />
+  <img src="https://raw.githubusercontent.com/nikitastetskiy/doom-sandbox/output/doom.gif?run=30853294303" alt="DOOM (LIVE)" />
 </p>
 
 | | | |
