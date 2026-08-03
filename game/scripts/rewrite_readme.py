@@ -13,12 +13,22 @@ never consulted.  Control-table labels, titles and the disabled placeholder are
 read at runtime from the mapping file, so the rendered links are canonical by
 construction (the self-consistency test parses every one of them).
 
+The control-link target (SPEC 9.1) is supplied at render time and is **not** a
+value this module may know.  Every rendered link must open an issue on the
+repository whose own workflow will drain it, and only the execution
+environment's ``GITHUB_REPOSITORY`` has that property by definition.  This file
+previously carried the profile repository as a module constant, so a rehearsal
+sandbox rendered 12 of 12 links pointing at the profile -- a boundary violation
+and a dead control, from one correct-looking literal.  There is therefore no
+default and no fallback: rendering the table without a target is a usage error.
+
 Usage: rewrite_readme.py --readme PATH [--mapping PATH]
                         --state {LIVE,PAUSED,UNAVAILABLE,LOG_FULL,SEALED}
-                        --image-url URL [--controls-enabled]
+                        --image-url URL
+                        [--controls-enabled --repository OWNER/NAME]
 Exit codes: 0 ok / 2 usage / 6 marker-validation failure
 
-@see game/SPEC.md sections 9 and 11; game/mapping/v1.json control_links;
+@see game/SPEC.md sections 9, 9.1 and 11; game/mapping/v1.json control_links;
     RFC must_have 8
 """
 
@@ -28,6 +38,7 @@ import argparse
 import html
 import json
 import os
+import re
 import sys
 import tempfile
 import urllib.parse
@@ -49,11 +60,24 @@ MARKER_END = b"<!-- DOOM:END -->"
 #: LOADING is defined by SPEC section 11 but off by default in v1.
 STATES = ("LIVE", "PAUSED", "UNAVAILABLE", "LOG_FULL", "SEALED")
 
-#: SPEC section 9: the prefilled new-issue endpoint and body copy.  Neither has
-#: a mapping representation -- they are the intake channel itself, not a
-#: normative value table.
-ISSUE_NEW_URL = "https://github.com/nikitastetskiy/nikitastetskiy/issues/new"
+#: SPEC section 9: the prefilled new-issue body copy.  It has no mapping
+#: representation -- it is the intake channel itself, not a normative value
+#: table.  The endpoint's *repository* is deliberately absent: see SPEC 9.1 and
+#: ``--repository``.
 ISSUE_BODY_TEXT = "Just press Submit — your move runs automatically."
+
+#: SPEC 9.1, verbatim: ``\A[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9._-]{1,100}\z``.
+#: Anchored at both ends (``fullmatch``) and ASCII-only by construction -- every
+#: class is an explicit ASCII range, so no unicode digit or letter can enter.
+#:
+#: This is the entire escaping strategy, not a courtesy check.  The value is
+#: interpolated into the URL path UNESCAPED because the ``/`` between owner and
+#: name is structural, and that is sound only because the grammar admits no
+#: character that is special in a URL (``? # & % : @`` and space) or in a
+#: Markdown link target (``( ) < > " ` \`` and space).  An unanchored match would
+#: admit a valid target with arbitrary bytes attached, which is the one way an
+#: unescaped interpolation can escape.  It may not be relaxed without replacing it.
+REPOSITORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9._-]{1,100}")
 
 CONTROL_TABLE_COLUMNS = 3
 
@@ -63,10 +87,15 @@ def _emit(payload: dict) -> None:
     sys.stdout.write("\n")
 
 
-def control_href(title: str) -> str:
-    """RFC 3986 %-encoded prefilled-issue URL for one canonical title."""
+def control_href(title: str, repository: str) -> str:
+    """RFC 3986 %-encoded prefilled-issue URL for one canonical title.
+
+    ``repository`` is SPEC 9.1's ``<owner>/<name>`` target, already validated
+    against ``REPOSITORY_RE`` by the caller -- which is what licenses splicing
+    it into the path unescaped.
+    """
     return (
-        ISSUE_NEW_URL
+        f"https://github.com/{repository}/issues/new"
         + "?title=" + urllib.parse.quote(title, safe="")
         + "&body=" + urllib.parse.quote(ISSUE_BODY_TEXT, safe="")
     )
@@ -83,11 +112,16 @@ def control_label(title: str, mapping: dict) -> str:
     return f"{labels[base]} x{suffix}"
 
 
-def render_controls(mapping: dict, controls_enabled: bool) -> str:
+def render_controls(mapping: dict, controls_enabled: bool, repository) -> str:
     if not controls_enabled:
+        # No link is rendered, so there is nothing to target -- which is exactly
+        # why SPEC 9.1 requires a target if and only if the table is rendered.
         return mapping["controls_disabled_placeholder"] + "\n"
+    if repository is None:
+        raise ValueError("SPEC 9.1: the control table needs a link target")
     titles = list(mapping["control_links"])
-    cells = [f"[{control_label(t, mapping)}]({control_href(t)})" for t in titles]
+    cells = [f"[{control_label(t, mapping)}]({control_href(t, repository)})"
+             for t in titles]
     lines = [
         "|" + " |" * CONTROL_TABLE_COLUMNS,
         "|" + " :---: |" * CONTROL_TABLE_COLUMNS,
@@ -98,7 +132,8 @@ def render_controls(mapping: dict, controls_enabled: bool) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_block(mapping: dict, state: str, image_url: str, controls_enabled: bool) -> bytes:
+def render_block(mapping: dict, state: str, image_url: str, controls_enabled: bool,
+                 repository) -> bytes:
     """The full marker-block body. Pure function of its arguments."""
     src = html.escape(image_url, quote=True)
     alt = html.escape(f"DOOM ({state})", quote=True)
@@ -108,7 +143,7 @@ def render_block(mapping: dict, state: str, image_url: str, controls_enabled: bo
         f"  <img src=\"{src}\" alt=\"{alt}\" />\n"
         "</p>\n"
         "\n"
-        + render_controls(mapping, controls_enabled)
+        + render_controls(mapping, controls_enabled, repository)
         + "\n"
     )
     return block.encode("utf-8")
@@ -169,7 +204,33 @@ def main(argv=None) -> int:
     parser.add_argument("--state", required=True, choices=STATES)
     parser.add_argument("--image-url", dest="image_url", required=True)
     parser.add_argument("--controls-enabled", dest="controls_enabled", action="store_true")
+    parser.add_argument(
+        "--repository", default=None,
+        help="SPEC 9.1 control-link target as <owner>/<name>, supplied by the "
+             "workflow from GITHUB_REPOSITORY. Required if and only if "
+             "--controls-enabled. No default and no fallback.",
+    )
     args = parser.parse_args(argv)
+
+    # SPEC 9.1, before anything is read or written so a reject leaves the README
+    # byte-untouched.  A supplied value is validated whether or not it will be
+    # used: the grammar IS the escaping strategy, so an invalid value is a usage
+    # error, never a render.
+    if args.repository is not None and REPOSITORY_RE.fullmatch(args.repository) is None:
+        sys.stderr.write(
+            "rewrite_readme: --repository must match "
+            "<owner>/<name> per SPEC 9.1\n"
+        )
+        return EXIT_USAGE
+    # No default and no fallback: a default is indistinguishable from a hardcode
+    # at the exact moment it matters -- the first deployment that is not the one
+    # the default names.
+    if args.controls_enabled and args.repository is None:
+        sys.stderr.write(
+            "rewrite_readme: --repository is required with --controls-enabled "
+            "(SPEC 9.1: the control table is never rendered against a guess)\n"
+        )
+        return EXIT_USAGE
 
     readme = Path(args.readme)
     if not readme.is_file():
@@ -203,7 +264,8 @@ def main(argv=None) -> int:
 
     start, end = bounds
     try:
-        block = render_block(mapping, args.state, args.image_url, args.controls_enabled)
+        block = render_block(mapping, args.state, args.image_url,
+                             args.controls_enabled, args.repository)
     except (KeyError, ValueError):
         sys.stderr.write("rewrite_readme: mapping is missing control-table values\n")
         return EXIT_USAGE
