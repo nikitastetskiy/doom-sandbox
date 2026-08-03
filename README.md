@@ -26,10 +26,15 @@
 <!-- DOOM:START -->
 
 <p align="center">
-  <img src="game/assets/screens/paused.png" alt="DOOM (PAUSED)" />
+  <img src="https://raw.githubusercontent.com/nikitastetskiy/doom-sandbox/output/doom.gif?run=30846466666" alt="DOOM (LIVE)" />
 </p>
 
-🕹️ Controls are being wired up — the arcade opens soon.
+| | | |
+| :---: | :---: | :---: |
+| [⬆️ Forward](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20forward&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) | [⬆️ Forward x5](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20forward%20x5&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) | [🏃 Run forward x5](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20run-forward%20x5&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) |
+| [⬇️ Back](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20back&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) | [⬅️ Turn left](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20turn-left&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) | [➡️ Turn right](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20turn-right&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) |
+| [⬅️ Turn left x3](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20turn-left%20x3&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) | [➡️ Turn right x3](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20turn-right%20x3&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) | [🔫 Fire](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20fire&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) |
+| [🔫 Fire x3](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20fire%20x3&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) | [🚪 Use](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20use&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) | [🔄 New game](https://github.com/nikitastetskiy/doom-sandbox/issues/new?title=doom%3A%20new%20game&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically.) |
 
 <!-- DOOM:END -->
 
