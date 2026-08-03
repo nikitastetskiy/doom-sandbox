@@ -374,20 +374,22 @@ jobs:
           if [ -s "${RUNNER_TEMP}/moves.txt" ]; then moves=true; fi
           closes="$(jq -r '.post_push | length > 0' "${RUNNER_TEMP}/actions.json")"
 
-          # --- the degraded-mode outputs (SPEC section 10, degraded-mode note) --
+          # --- the drain's contract, validated before anything is derived -----
           #
-          # Everything below reads drain.py's machine-readable `reason` field
-          # and nothing else. SPEC 5.7 makes the six codes a normative CLOSED
-          # enum, mirrored in mapping `reason_codes`, and states the consumer
-          # rule directly: no consumer may string-match a player-visible
-          # message. Those are written for humans and may be reworded; the
-          # codes may not. So nothing here matches prose, and the enum is read
-          # from the mapping rather than retyped into YAML.
+          # Everything below reads drain.py's machine-readable fields and
+          # nothing else. SPEC 5.7 makes the six reason codes a normative CLOSED
+          # enum and SPEC 5.8 makes the three section states another; both are
+          # mirrored in the mapping, and both carry the same consumer rule: no
+          # consumer may string-match a player-visible message (those are
+          # written for humans and may be reworded; the codes may not), and no
+          # consumer may re-derive a normative predicate (SPEC 0.5). So nothing
+          # here matches prose, and both enums are read from the mapping rather
+          # than retyped into YAML.
           #
           # SPEC 5.7: "a drained issue that matches no row is a bug, not a
           # seventh outcome". Fail loudly on one rather than let it fall through
           # the arithmetic below, where an unrecognized code would silently
-          # count as a rejection and could swap in the wrong screen.
+          # count as a rejection.
           # tojson, not the bare value: an entry with NO `reason` field at all
           # yields null, and `join` renders null as the empty string - which
           # would leave $unknown empty and wave the defect straight through the
@@ -401,6 +403,64 @@ jobs:
             echo "::error::the drain emitted reason code(s) outside the SPEC 5.7 closed enum: ${unknown}. That is a defect in the drain, not a seventh outcome - refusing to act on the plan."
             exit 1
           fi
+
+          # --- the SPEC 5.8 section state, and the screen it selects ----------
+          #
+          # SPEC 5.8 clause 1 makes the `section` member unconditional on every
+          # exit-0 drain, so its ABSENCE is a contract violation and never
+          # "nothing to report": `open` is the value that says nothing to
+          # report, absence says the drain never told me, and those are
+          # different facts about different things. Defaulting absence to "no
+          # screen" would convert a broken producer into a silent one in
+          # exactly the case SPEC 5.8 exists to close - a sealed game left
+          # showing a stale live frame, indistinguishable from a healthy quiet
+          # run. All three deformations (member absent, present but not an
+          # object, present with no `state` key) are the same fault and take
+          # this same path.
+          #
+          # Checked BEFORE `.section.state` is read: indexing a string with
+          # `.state` is a jq error, and a jq error inside a command
+          # substitution ends the step with no `::error::` line behind it -
+          # reporting a contract violation as a harness crash.
+          if [ "$(jq -r 'if (.section | type) == "object" then (.section | has("state")) else false end' \
+                  "${RUNNER_TEMP}/actions.json")" != "true" ]; then
+            echo "::error::the drain emitted no SPEC 5.8 section state (got section=$(jq -c '.section' "${RUNNER_TEMP}/actions.json")). The member is unconditional on every exit-0 drain, so its absence is a broken producer - refusing to act on the plan rather than reading it as 'nothing to report'."
+            exit 1
+          fi
+          # Validated against mapping `section_states` exactly as the reason
+          # codes are above, and with the same tojson discipline so a null or a
+          # non-string is REPORTED rather than rendered as an empty string.
+          # `index` is exact JSON equality, so the match is byte-exact and
+          # `SEALED` is not `sealed` - the enum is a protocol, not prose.
+          unknown_state="$(jq -r --slurpfile m "${MAPPING}" \
+            '.section.state | select(. as $s | ($m[0].section_states | index($s)) == null) | tojson' \
+            "${RUNNER_TEMP}/actions.json")"
+          if [ -n "$unknown_state" ]; then
+            echo "::error::the drain reported section state ${unknown_state}, which is outside the SPEC 5.8 closed enum in mapping section_states. That is a defect in the drain, not a fourth state - refusing to act on the plan."
+            exit 1
+          fi
+          # SPEC 5.8 screen selection is a LOOKUP, not a predicate: this step
+          # maps a value it was handed and hard-fails on an unmapped one,
+          # rather than deciding for itself what "sealed" means. The pin
+          # comparison (SPEC 5.5) and the cap comparison (SPEC 6) are made once,
+          # by drain.py, which owns them; neither is re-derived here (SPEC 0.5),
+          # and that is what made the missing field the correct fix rather than
+          # a YAML-side workaround.
+          #
+          # Two guards, not one predicate written twice: the enum above is
+          # authoritative over which states EXIST, and the arms below are the
+          # SPEC section 11 screen table. A state the mapping lists and this
+          # table does not map is precisely the "unmapped" case SPEC 5.8 says to
+          # hard-fail on. These arms are bound to the swap step's own `case` by
+          # test_the_swap_step_maps_exactly_the_screens_the_lookup_can_produce,
+          # in both directions, so neither can grow an arm the other lacks.
+          state="$(jq -r '.section.state' "${RUNNER_TEMP}/actions.json")"
+          case "$state" in
+            sealed) state_screen=SEALED ;;
+            capped) state_screen=LOG_FULL ;;
+            open)   state_screen='' ;;
+            *) echo "::error::no SPEC section 11 screen is mapped for section state '${state}' - refusing to render an unmapped state"; exit 1 ;;
+          esac
           #
           # "Drained" excludes `duplicate`: an issue whose number is already in
           # the ledger is close-only cleanup. It never consumed the per-run cap
@@ -425,49 +485,31 @@ jobs:
           fi
 
           # all_rejected: at least one move was drained and not one of them was
-          # applied. This is a SUCCESS condition, not a failure - see the swap
-          # step and the run summary below.
+          # applied. This is a SUCCESS condition, not a failure - and after
+          # SPEC 5.8 it is a SUMMARY signal only. It no longer selects a screen.
           #
-          # Stated as SPEC 0 requires, so this signal is not a third gate
-          # specified against its motivating instance:
-          #   property established - "this run drained work and appended no
-          #     ledger line", which is the observable half of SPEC 5.5 rule 7's
-          #     governing property ("no frame-contributing line landed"). It is
-          #     the stricter of the two and that is the safe direction: if a
-          #     reset DID land, the section is no longer sealed and no guidance
-          #     screen should be shown.
-          #   evidence read - the reason codes in the drain's own action plan,
-          #     validated above against the mapping's closed enum.
-          #   residual NOT covered - rule 7 unifies three cases, and the reason
-          #     codes can only witness the one that carries a rejection. A batch
-          #     that is entirely `duplicate`, and a run with no pending input at
-          #     all, are the same case under rule 7 but emit no `sealed` code,
-          #     so a section that is sealed while nobody is submitting new moves
-          #     will not swap in SEALED here. Closing that needs a top-level
-          #     "this section is sealed" flag from drain.py, which owns
-          #     section_is_sealed(); re-deriving the pin comparison in YAML is
-          #     exactly what SPEC 5.7 and SPEC 0 forbid, so it is not done here.
-          #     Consequence is bounded: the swap fires on the next run that
-          #     drains a real move, which is also the next moment a player can
-          #     observe the screen.
+          # It cannot, and the residual this comment used to carry is what
+          # proved it: the reason codes witness a section's state only where
+          # there was a move to reject, so a section sealed or capped while
+          # nobody is submitting moves emitted no code and swapped no screen.
+          # That gap is closed by SPEC 5.8's section state, read above, and is
+          # not restated here - the field is unconditional, the derivation is
+          # drain.py's, and this step is a lookup.
+          #
+          # SPEC 11 rule 2 also makes all-rejected the wrong condition in the
+          # other direction: a batch whose applied moves carry the section over
+          # the SPEC 6 cap ends `capped` AND publishes a frame, so all_rejected
+          # is false on a run that genuinely has a state to report. The correct
+          # condition is "state selects the screen, and a publish suppresses
+          # it", which is where the swap step's `if:` implements it.
+          #
+          # What all_rejected still answers, and the only thing it is read for:
+          # did this run decline everything it drained? The run summary says so
+          # in prose, and a batch declined only for `grammar` or `cooldown` is
+          # ordinary operation on a live game with an accurate frame on display.
           all_rejected=false
-          # state_screen: which SPEC section 11 guidance screen the swap shows,
-          # empty when none applies. A batch rejected only for `grammar` or
-          # `cooldown` is still a live game with an accurate frame on display,
-          # so it swaps nothing.
-          state_screen=''
           if [ "$drained" -gt 0 ] && [ "$applied" -eq 0 ]; then
             all_rejected=true
-            # `sealed` wins where both appear. They are in fact mutually
-            # exclusive whenever applied == 0: only an applied `new game` can
-            # clear the sealed flag mid-batch, and that reset is itself a
-            # ledger line. The ordering is defensive, matching drain.py, which
-            # tests `sealed` before the section cap.
-            if [ "$(jq -r 'any(.post_push[].reason; . == "sealed")' "${RUNNER_TEMP}/actions.json")" = true ]; then
-              state_screen=SEALED
-            elif [ "$(jq -r 'any(.post_push[].reason; . == "section-cap")' "${RUNNER_TEMP}/actions.json")" = true ]; then
-              state_screen=LOG_FULL
-            fi
           fi
 
           {
@@ -476,7 +518,7 @@ jobs:
             echo "all_rejected=${all_rejected}"
             echo "state_screen=${state_screen}"
           } >> "$GITHUB_OUTPUT"
-          echo "moves=${moves} closes=${closes} drained=${drained} applied=${applied} all_rejected=${all_rejected} state_screen=${state_screen:-none}"
+          echo "moves=${moves} closes=${closes} drained=${drained} applied=${applied} all_rejected=${all_rejected} section=${state} state_screen=${state_screen:-none}"
 
       # --- render: toolchain, apply, simulate, encode ------------------------
 
@@ -825,7 +867,21 @@ jobs:
           done
 
           [ "$published" = true ] || { echo "::error::the budget ladder ended without a publishable GIF"; exit 1; }
-          echo "size=$(stat -c%s "$gif") bytes" >> "$GITHUB_STEP_SUMMARY"
+          # `wc -c`, not `stat -c%s`: the GNU form is correct on ubuntu-24.04
+          # and errors on macOS (BSD stat wants -f%z), but inside a command
+          # substitution that error does NOT trip `set -e` - the size lands as
+          # the empty string and the summary prints "size= bytes". Same shape
+          # as the jq `join` trap the work step guards against: a failure that
+          # renders as emptiness rather than as a non-zero exit. `wc -c < file`
+          # is portable, and the value is asserted non-empty AND numeric before
+          # it is reported, so a broken read can never be published as a fact.
+          published_size="$(wc -c < "$gif" | tr -d '[:space:]')"
+          case "$published_size" in
+            '' | *[!0-9]*)
+              echo "::error::could not read the size of the published GIF (got '${published_size}') - refusing to report an unread value as a measurement"
+              exit 1 ;;
+          esac
+          echo "size=${published_size} bytes" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Rewrite the README game block to LIVE
         id: rewrite
@@ -924,22 +980,61 @@ jobs:
 
       - name: Swap in the SEALED or LOG_FULL guidance screen
         id: state_swap
-        # SPEC section 10, degraded-mode note, and SPEC 5.5 rule 7: a run whose
-        # drained moves were ALL rejected in band is a SUCCESS with zero ledger
-        # appends, no GIF publish, and a display-only swap. It is not a failure
-        # row of the write contract - nothing failed, and no game state was
-        # ever eligible to change. Nothing here may make the run red, and the
-        # summary must not let it read as an error.
+        # SPEC section 10, degraded-mode note, and SPEC 5.5 rule 7: a run that
+        # appended no ledger line is a SUCCESS with zero appends, no GIF
+        # publish, and a display-only swap. It is not a failure row of the
+        # write contract - nothing failed, and no game state was ever eligible
+        # to change. Nothing here may make the run red, and the summary must
+        # not let it read as an error.
         #
-        # Keyed on drain.py's reason codes via the `work` step, never on the
-        # player-visible guidance prose (which is normative text owned by the
-        # SPEC, not a protocol) and never on a re-derived YAML constant.
+        # The condition is SPEC 11's precedence, which is a table and not a
+        # tie-break. At most one screen is written per run, by the first rule
+        # that applies:
+        #
+        #   1. the abuse halt writes PAUSED and stops (SPEC 6) - so no step
+        #      below it runs at all, `work` included;
+        #   2. a run that PUBLISHES a frame shows LIVE (SPEC 10 success row). A
+        #      fresh frame is truer than guidance, and the section's condition
+        #      surfaces on the next run, which is also the next moment a player
+        #      can act on it;
+        #   3. otherwise the guidance screen selected by the SPEC 5.8 section
+        #      state outranks PAUSED - a blocked section that keeps drawing
+        #      moves is not idle, it is being played and answered;
+        #   4. UNAVAILABLE is written only on the failure rows of SPEC 10, and
+        #      never over a guidance screen the same run already pushed.
+        #
+        # So: STATE SELECTS THE SCREEN, A PUBLISH SUPPRESSES IT. Two terms,
+        # both load-bearing, and neither is `all_rejected`:
+        #
+        #   - gating on all-rejected is the defect SPEC 5.8 was written to
+        #     remove. A sealed section with an empty queue rejects nothing, so
+        #     an all-rejected gate leaves exactly the visitor the field exists
+        #     for staring at a stale frame;
+        #   - the state alone is not decisive either. Rule 2 strictly precedes
+        #     rule 3 and is reached by the common case, not an exotic one: a
+        #     batch whose applied moves carry the section over the SPEC 6 cap
+        #     reports `capped` AND publishes on the same run, and neither is a
+        #     failure. `moves != 'true'` is that suppressor - it is the SPEC 10
+        #     governing property ("the absence of an append") rather than a
+        #     proxy for it, and with no append there was nothing to simulate,
+        #     encode or push, so the LIVE frame this run would have overwritten
+        #     cannot exist.
+        #
+        # The mirror case cannot arise: a run cannot end `sealed` and publish,
+        # because while sealed the sole admissible move is the zero-frame
+        # rollover (SPEC 5.5 rule 2) and applying it un-seals. So suppressing
+        # guidance behind a publish can never suppress SEALED.
+        #
+        # Keyed on the drain's machine-readable section state via the `work`
+        # step, never on the player-visible guidance prose (which is normative
+        # text owned by the SPEC, not a protocol) and never on a re-derived
+        # YAML constant.
         #
         # Placed before the closes on purpose: the push-then-close ordering is
         # the same discipline the drain plan is built around.
         if: >-
-          steps.work.outputs.all_rejected == 'true'
-          && steps.work.outputs.state_screen != ''
+          steps.work.outputs.state_screen != ''
+          && steps.work.outputs.moves != 'true'
           && env.DRY_RUN != 'true'
         # Display-only and best effort, exactly like the UNAVAILABLE swap: this
         # push can lose a race with another writer, and turning a spec-defined
@@ -1041,18 +1136,25 @@ jobs:
       # --- sweep tail and the failure-path write contract --------------------
 
       - name: Show PAUSED after inactivity
-        # `all_rejected` is excluded, and it is reachable here: idleness is
-        # measured from the last game-state COMMIT, and a section that has been
-        # sealed (or capped) for IDLE_PAUSE_DAYS keeps drawing moves that are
-        # rejected in band without ever appending to the ledger. In that state
-        # the game is not idle - it is being played and answered - so PAUSED
-        # would be a lie, and it would silently overwrite the SEALED/LOG_FULL
-        # screen this same run just pushed. The guidance screen wins.
+        # SPEC 11 rule 3: a guidance screen selected by the SPEC 5.8 section
+        # state OUTRANKS PAUSED, so this step is suppressed whenever the `work`
+        # step selected one. The suppressor is the state screen itself, not
+        # `all_rejected`, for the same reason the swap gate above is not: the
+        # reason codes only witness a section's state where there was a move to
+        # reject, and this step is reachable in exactly the case they cannot
+        # witness. Idleness is measured from the last game-state COMMIT, which
+        # a blocked section never produces, so a section sealed or capped for
+        # IDLE_PAUSE_DAYS crosses the idle threshold while the game is
+        # demonstrably in use - and under the old `all_rejected` condition a
+        # QUIET blocked game (nothing drained, nothing rejected) would have
+        # sailed through and overwritten its own guidance screen with PAUSED.
+        # In that state the game is not idle, it is being played and answered,
+        # so PAUSED would misreport WHY the frame is not moving.
         if: >-
           github.event_name == 'schedule'
           && steps.guard.outputs.idle == 'true'
           && steps.work.outputs.moves != 'true'
-          && steps.work.outputs.all_rejected != 'true'
+          && steps.work.outputs.state_screen == ''
         run: |
           set -euo pipefail
           controls=()
@@ -1160,22 +1262,32 @@ jobs:
           # for a fault that does not exist.
           #
           # The narrative is keyed on the STATE SCREEN, not on all_rejected.
-          # The two are not the same set: a batch rejected only for `grammar`
-          # or `cooldown` is also "all rejected", but it is ordinary operation
-          # on a live game with an accurate frame on display - calling it
-          # degraded mode, or claiming a swap that did not happen, would be
-          # false.
+          # The two are not the same set in EITHER direction, which is why the
+          # screen is the key:
+          #   - a batch rejected only for `grammar` or `cooldown` is also "all
+          #     rejected", but it is ordinary operation on a live game with an
+          #     accurate frame on display - calling it degraded mode, or
+          #     claiming a swap that did not happen, would be false;
+          #   - a section sealed or capped with an EMPTY QUEUE reports its
+          #     screen (SPEC 5.8) while all_rejected is false, because there
+          #     was nothing to reject. That is the case the screen exists for,
+          #     so the narrative must reach it too.
+          # Hence the wording below says what is true of both: no ledger line
+          # landed. It does not claim moves were drained, because on the quiet
+          # run none were.
           if [ "${STATE_SCREEN}" = "SEALED" ] || [ "${STATE_SCREEN}" = "LOG_FULL" ]; then
             {
               echo ""
               echo "#### Degraded mode - this run SUCCEEDED"
               echo ""
-              echo "Every move this run drained was rejected in band, so there was nothing to"
-              echo "append and nothing to publish. That is the defined outcome (SPEC section 10,"
-              echo "degraded-mode note), not a fault:"
+              echo "No ledger line landed this run, so there was nothing to append and nothing to"
+              echo "publish. That is the defined outcome (SPEC section 10, degraded-mode note),"
+              echo "not a fault - and it is the same outcome whether moves were drained and"
+              echo "declined in band, the batch was entirely duplicates, or nobody submitted"
+              echo "anything at all:"
               echo ""
               echo "- zero ledger appends, no GIF encode, no \`output\` push - none were eligible;"
-              echo "- the rejected issues were closed with their fixed guidance message;"
+              echo "- any rejected issues were closed with their fixed guidance message (post-push actions: ${CLOSES});"
               echo "- the README game block was swapped to \`${STATE_SCREEN}\` (swap outcome: ${SWAP_OUTCOME})."
               echo ""
               if [ "${STATE_SCREEN}" = "SEALED" ]; then
