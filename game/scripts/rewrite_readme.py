@@ -14,11 +14,12 @@ read at runtime from the mapping file, so the rendered links are canonical by
 construction (the self-consistency test parses every one of them).
 
 Usage: rewrite_readme.py --readme PATH [--mapping PATH]
-                        --state {LIVE,PAUSED,UNAVAILABLE,LOG_FULL}
+                        --state {LIVE,PAUSED,UNAVAILABLE,LOG_FULL,SEALED}
                         --image-url URL [--controls-enabled]
 Exit codes: 0 ok / 2 usage / 6 marker-validation failure
 
-@see game/SPEC.md section 9; game/mapping/v1.json control_links; RFC must_have 8
+@see game/SPEC.md sections 9 and 11; game/mapping/v1.json control_links;
+    RFC must_have 8
 """
 
 from __future__ import annotations
@@ -41,7 +42,12 @@ EXIT_MARKER = 6
 MARKER_START = b"<!-- DOOM:START -->"
 MARKER_END = b"<!-- DOOM:END -->"
 
-STATES = ("LIVE", "PAUSED", "UNAVAILABLE", "LOG_FULL")
+#: SPEC section 11 state screens.  SEALED is the pin-mismatch guidance state
+#: (SPEC 5.5): distinct from UNAVAILABLE (moves *are* being processed) and from
+#: LOG_FULL (the section is not full -- its toolchain moved).  The workflow
+#: selects it from drain's ``sealed`` reason code, never from message prose.
+#: LOADING is defined by SPEC section 11 but off by default in v1.
+STATES = ("LIVE", "PAUSED", "UNAVAILABLE", "LOG_FULL", "SEALED")
 
 #: SPEC section 9: the prefilled new-issue endpoint and body copy.  Neither has
 #: a mapping representation -- they are the intake channel itself, not a

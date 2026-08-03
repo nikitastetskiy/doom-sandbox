@@ -8,18 +8,24 @@ motifs are plain rectangles/triangles -- which is what keeps the licensing story
 of a public profile page clean (plan step E6, task 1).
 
 Run:  python3 game/assets/screens/make_screens.py
-Out:  game/assets/screens/{paused,unavailable,log-full}.png  (320x200, RGB8)
+Out:  game/assets/screens/{paused,unavailable,log-full,sealed}.png (320x200, RGB8)
 
 Screen copy is honest per SPEC section 11:
   PAUSED       -- the default "press play" idle state
   UNAVAILABLE  -- "moves are not being processed right now" (the prior frame is
                   still accurate history; it is not wrong)
   LOG FULL     -- section cap reached: "log full - start a new game"
+  SEALED       -- the current section's toolchain pins moved (SPEC 5.5), so the
+                  section can no longer advance: "the arcade is being upgraded -
+                  press New game to continue".  Distinct from UNAVAILABLE (moves
+                  ARE being processed) and from LOG FULL (the section is not
+                  full).  Screen-legible rendering of the drain's verbatim
+                  sealed-reject message.
 
 LOADING is defined by SPEC section 11 but off by default in v1, so it is not
 generated here.
 
-@see game/SPEC.md section 11; RFC 001 component 6
+@see game/SPEC.md sections 5.5 and 11; RFC 001 component 6
 """
 
 import struct
@@ -227,6 +233,16 @@ def motif_warning(canvas: Canvas, color) -> None:
     canvas.rect(158, 40, 162, 42, color)
 
 
+def motif_padlock(canvas: Canvas, color, keyhole) -> None:
+    """A closed padlock -- the section is sealed, not broken."""
+    canvas.rect(150, 16, 170, 19, color)   # shackle crown
+    canvas.rect(150, 16, 153, 31, color)   # shackle legs, sunk into the body
+    canvas.rect(167, 16, 170, 31, color)
+    canvas.rect(140, 28, 180, 50, color)   # body
+    canvas.rect(157, 34, 163, 40, keyhole)  # keyhole, punched out of the body
+    canvas.rect(158, 40, 162, 46, keyhole)
+
+
 def motif_full_meter(canvas: Canvas, color, fill) -> None:
     """A meter pegged at 100% -- the section cap, drawn literally."""
     canvas.frame(110, 26, 210, 44, color, thickness=2)
@@ -268,10 +284,22 @@ def build_log_full() -> Canvas:
     return canvas
 
 
+def build_sealed() -> Canvas:
+    accent, accent_dim = (92, 176, 214), (28, 62, 86)
+    canvas = backdrop(accent, accent_dim)
+    motif_padlock(canvas, accent, (14, 26, 36))
+    canvas.centered("SEALED", 62, 4, accent)
+    canvas.centered("the arcade is being", 112, 2, INK)
+    canvas.centered("upgraded — press", 136, 2, INK)
+    canvas.centered("NEW GAME to continue", 164, 2, DIM)
+    return canvas
+
+
 SCREENS = {
     "paused.png": build_paused,
     "unavailable.png": build_unavailable,
     "log-full.png": build_log_full,
+    "sealed.png": build_sealed,
 }
 
 MAX_BYTES = 500_000
