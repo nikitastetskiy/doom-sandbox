@@ -46,16 +46,23 @@ it is run-local -- never written into ``game/state/``, and not a
 ``mapping_version`` bump.
 
 Sealed mode (SPEC 5.5, normative).  ``--toolchain`` is the comparand: when any
-pin in the current section's header (engine / build / wad / mapping) disagrees
-with ``game/toolchain.json`` plus the mapping version, the section is sealed and
-the only admissible move is ``doom: new game``.  Every other otherwise-valid
-move is *close-rejected in band* with the fixed guidance message, never by
-failing the run -- the drain processes issues in ascending number order, so
-refusing the batch would re-refuse the same low-numbered issue on every
-subsequent run, forever, and the game could never be rescued without a human
-closing issues by hand.  The ``new game`` cooldown does not apply while sealed
-(rule 6): a sealed game cannot advance, so the anti-grief purpose is
-inapplicable and a visitor cannot induce a mismatch.
+**sealing pin** in the current section's header (``game/mapping/v1.json``
+``sealing_pins``: engine / wad / mapping) disagrees with ``game/toolchain.json``
+plus the mapping version, the section is sealed and the only admissible move is
+``doom: new game``.  Every other otherwise-valid move is *close-rejected in
+band* with the fixed guidance message, never by failing the run -- the drain
+processes issues in ascending number order, so refusing the batch would
+re-refuse the same low-numbered issue on every subsequent run, forever, and the
+game could never be rescued without a human closing issues by hand.  The ``new
+game`` cooldown does not apply while sealed (rule 6): a sealed game cannot
+advance, so the anti-grief purpose is inapplicable and a visitor cannot induce a
+mismatch.
+
+The predicate itself lives in ``gamelog.py`` and is *called* here, never
+re-implemented (SPEC 0.5): two copies reading a **different comparand** for the
+same pin is what produced the SPEC 5.9 livelock.  ``build`` is not among the
+pins -- it is provenance, and a runner-image rotation moves it without changing
+the replay -- so this script never reads ``engine.build_sha256`` at all.
 
 Usage: drain.py --issues FILE --ledger FILE [--mapping PATH] --toolchain PATH
                 --out-moves PATH --out-actions PATH
@@ -154,17 +161,6 @@ def close_entry(issue: int, reason: str, message=None) -> dict:
     """
     return {"issue": issue, "action": ACTION_FOR_REASON[reason],
             "message": message, "reason": reason}
-
-
-def section_is_sealed(header, engine: str, build: str, wad: str,
-                      mapping_version: int) -> bool:
-    """SPEC 5.5: any header pin disagreeing with the running toolchain seals."""
-    return (
-        header.engine != engine
-        or header.build != build
-        or header.wad != wad
-        or header.mapping != mapping_version
-    )
 
 
 def section_state(section_states, sealed: bool, at_cap: bool) -> str:
@@ -305,13 +301,13 @@ def main(argv=None) -> int:
         return _fail("mapping file has no usable section_states table", EXIT_USAGE)
     reset_id = reset_token_id(mapping)
 
-    # SPEC 5.5: the sealing comparand is the checked-out toolchain file, never a
+    # SPEC 5.5: the sealing comparands are the checked-out toolchain file, never a
     # restored artifact -- which is why this step can run before the engine is
-    # even fetched.
+    # even fetched.  SPEC 5.9: ``engine.build_sha256`` is deliberately NOT read
+    # here; it is provenance, so the drain has nothing to compare it against.
     try:
         toolchain = json.loads(toolchain_path.read_text(encoding="utf-8"))
         running_engine = toolchain["engine"]["commit_sha"]
-        running_build = toolchain["engine"]["build_sha256"]["value"]
         running_wad = toolchain["wad"]["sha256"]
     except (OSError, UnicodeDecodeError, KeyError, TypeError, ValueError):
         return _fail("toolchain file carries no readable engine/wad pins", EXIT_CORRUPT)
@@ -343,8 +339,13 @@ def main(argv=None) -> int:
         frames_per_token.get(entry.token, 0) * entry.count
         for entry in log.sections[-1].entries
     )
-    sealed = section_is_sealed(log.sections[-1].header, running_engine,
-                               running_build, running_wad, mapping_version)
+    sealed = gamelog.section_is_sealed(
+        log.sections[-1].header,
+        engine=running_engine,
+        wad=running_wad,
+        mapping_version=mapping_version,
+        mapping=mapping,
+    )
 
     moves = []
     move_lines = []

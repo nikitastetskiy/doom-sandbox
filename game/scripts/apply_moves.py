@@ -15,19 +15,29 @@ What it does, in order:
   2. **Roll the section over** on a ``new-game`` directive: the directive is the
      closing section's final line (SPEC 5.3) and the next header is written with
      the *running* pins, which is how an engine/mapping bump legitimately enters
-     the log.
+     the log.  Its ``build=`` records, as SPEC 5.9 provenance, the hash of the
+     binary that produced this section's frames.
   3. **Regenerate** ``--stream`` as ``expand(current section)`` -- the RFC D13
      invariant ``stream == expand(ledger, mapping_version)`` enforced at the
      mutation site rather than only checked in CI.
 
-Sealed sections (SPEC 5.5, normative).  A section is sealed when any header pin
-(engine / build / wad / mapping) disagrees with the running toolchain; sealing
-is computed here at run time and never stored.  A sealed section never advances
-and is never re-simulated: its stream is left byte-untouched and the sole
-admissible line is the zero-frame ``new-game`` rollover.  If a frame-contributing
-line would land in a sealed section this script **refuses with exit 7 and writes
-nothing** (rule 4, defense in depth -- correct drain behaviour rejects those
-in-band, so this path should never trigger).
+Sealed sections (SPEC 5.5, normative).  A section is sealed when any **sealing
+pin** (``game/mapping/v1.json`` ``sealing_pins``: engine / wad / mapping)
+disagrees with the running toolchain; sealing is computed here at run time and
+never stored.  A sealed section never advances and is never re-simulated: its
+stream is left byte-untouched and the sole admissible line is the zero-frame
+``new-game`` rollover.  If a frame-contributing line would land in a sealed
+section this script **refuses with exit 7 and writes nothing** (rule 4, defense
+in depth -- correct drain behaviour rejects those in-band, so this path should
+never trigger).
+
+What makes rule 4 *depth* rather than a second copy (SPEC 0.5) is the
+**evidence**: it re-reads the ledger file and the batch itself instead of
+trusting the drain's plan.  It therefore calls the same ``gamelog``
+implementation of the predicate and must not substitute a different comparand
+for any pin -- SPEC 5.9 records the livelock that followed when it did.
+``--engine-build-sha256`` is consequently **write-only**: it is stamped into a
+section header opened by a rollover and is never compared.
 
 Serialization goes exclusively through ``gamelog``; every blob is rendered and
 then re-parsed by the same module before it is allowed near the filesystem, and
@@ -86,16 +96,6 @@ def reset_token_id(mapping: dict) -> str:
         if entry.get("control") == RESET_CONTROL:
             return entry["id"]
     return RESET_TOKEN
-
-
-def is_sealed(header, engine: str, build: str, wad: str, mapping_version: int) -> bool:
-    """SPEC 5.5: any header pin disagreeing with the running toolchain seals."""
-    return (
-        header.engine != engine
-        or header.build != build
-        or header.wad != wad
-        or header.mapping != mapping_version
-    )
 
 
 def parse_moves(text: str, mapping: dict) -> list:
@@ -176,8 +176,12 @@ def main(argv=None) -> int:
         if not path.is_file():
             return _fail(f"{label} file not found", EXIT_USAGE)
 
-    running_build = args.engine_build_sha256
-    if _HEX64_RE.fullmatch(running_build) is None:
+    # SPEC 5.9: WRITE-ONLY.  This is the hash of the binary that actually ran; it
+    # is stamped into the header of any section opened by a rollover and is never
+    # compared against anything.  Validated anyway, because a header carrying a
+    # malformed digest would be an unparseable ledger line.
+    observed_build = args.engine_build_sha256
+    if _HEX64_RE.fullmatch(observed_build) is None:
         return _fail("--engine-build-sha256 is not a 64-character lowercase hex digest",
                      EXIT_USAGE)
 
@@ -239,8 +243,13 @@ def main(argv=None) -> int:
             skipped += 1  # RFC D14: the issue number is the exactly-once key
             continue
         current = log.sections[-1]
-        sealed = is_sealed(current.header, running_engine, running_build,
-                           running_wad, mapping_version)
+        sealed = gamelog.section_is_sealed(
+            current.header,
+            engine=running_engine,
+            wad=running_wad,
+            mapping_version=mapping_version,
+            mapping=mapping,
+        )
         frames = frames_per_token.get(entry.token, 0) * entry.count
         if sealed and frames > 0:
             # SPEC 5.5 rule 4. Refuse rather than advance a sealed section: the
@@ -257,12 +266,13 @@ def main(argv=None) -> int:
         appended += 1
         if entry.token == reset_id:
             # SPEC 5.3: the directive closes this section and the next header
-            # follows immediately, carrying the RUNNING pins (SPEC 5.5 rule 2).
+            # follows immediately, carrying the RUNNING pins (SPEC 5.5 rule 2)
+            # plus, as SPEC 5.9 provenance, the hash of the binary that ran.
             log.sections.append(gamelog.Section(
                 header=gamelog.Header(
                     n=current.header.n + 1,
                     engine=running_engine,
-                    build=running_build,
+                    build=observed_build,
                     wad=running_wad,
                     mapping=mapping_version,
                 ),
@@ -271,8 +281,13 @@ def main(argv=None) -> int:
             rollovers += 1
 
     current = log.sections[-1]
-    current_sealed = is_sealed(current.header, running_engine, running_build,
-                               running_wad, mapping_version)
+    current_sealed = gamelog.section_is_sealed(
+        current.header,
+        engine=running_engine,
+        wad=running_wad,
+        mapping_version=mapping_version,
+        mapping=mapping,
+    )
 
     # --- Render, then re-parse what was rendered -----------------------------
     try:

@@ -69,6 +69,20 @@ def _count_bounds(mapping=None):
     return repeatable, int(doc["repeat"]["max"])
 
 
+def sealing_pins(mapping=None) -> tuple:
+    """SPEC 5.9: the header fields that seal a section, read from the mapping.
+
+    ``build`` is deliberately absent: it records *which binary* produced a
+    section's frames, and two artifacts of the same pinned input replay
+    identically, so sealing on it seals on a property the replay does not have.
+    An empty list is refused rather than silently never sealing.
+    """
+    pins = tuple(resolve_mapping(mapping)["sealing_pins"])
+    if not pins:
+        raise ValueError("mapping lists no sealing pins")
+    return pins
+
+
 # --- Grammar constants (SPEC section 5; no mapping representation) ----------
 
 #: SPEC 5.4 frame alphabet -- the doomreplay key set.  ``e``/``x`` are absent
@@ -125,6 +139,60 @@ class Section:
 @dataclass
 class Log:
     sections: list = field(default_factory=list)
+
+
+# --- Sealing (SPEC 5.5 / 5.9) -------------------------------------------------
+#
+# The one implementation site (SPEC 0.5).  ``drain.py`` and ``apply_moves.py``
+# both call ``section_is_sealed``; neither compares a header pin itself.
+#
+# Before SPEC 5.9 there were two copies reading *different comparands* for
+# ``build``: the drain read ``game/toolchain.json``, ``apply_moves.py`` read the
+# binary observed at run time.  Under a rotated runner image with a lagging pin
+# the two disagree, and the disagreement composes into a livelock -- the drain
+# sees no mismatch and admits a reset, ``apply_moves.py`` opens the next section
+# carrying the *observed* hash, and the following drain seals that fresh section
+# against the *committed* one.  One sealed-on-arrival section per reset, forever,
+# in committed state.  Removing ``build`` leaves both callers reading only
+# committed values, so they cannot disagree by construction.
+
+#: How each sealing pin is compared, keyed by the SPEC 5.2 header field it reads.
+#: The mapping's ``sealing_pins`` decides *which* of these run; this table decides
+#: only *how* each one is compared.  A pin listed in the mapping with no entry
+#: here raises rather than being skipped -- a silently skipped pin is a section
+#: that never seals.
+_PIN_DISAGREES = {
+    "engine": lambda header, comparands: header.engine != comparands["engine"],
+    "wad": lambda header, comparands: header.wad != comparands["wad"],
+    "mapping": lambda header, comparands: header.mapping != comparands["mapping_version"],
+}
+
+
+def section_is_sealed(header, *, engine, wad, mapping_version, mapping=None) -> bool:
+    """SPEC 5.5/5.9: True iff any sealing pin in ``header`` disagrees.
+
+    Keyword-only, one comparand per sealing pin and deliberately **no**
+    ``build`` parameter: the signature is what makes "``build`` is never a
+    comparand" true by construction rather than by discipline.  ``build=`` stays
+    in the SPEC 5.2 header as provenance -- ``apply_moves.py`` stamps it at
+    section open from the hash of the binary that actually ran, and nothing ever
+    reads it back.
+
+    ``mapping`` is the mapping *document* (dict, path, or None for the default
+    file), consistent with every other function here; ``mapping_version`` is the
+    comparand for the header's ``mapping=`` pin.
+    """
+    comparands = {"engine": engine, "wad": wad, "mapping_version": mapping_version}
+    for pin in sealing_pins(mapping):
+        try:
+            disagrees = _PIN_DISAGREES[pin]
+        except KeyError:
+            raise ValueError(
+                f"mapping lists a sealing pin with no comparand: {pin}"
+            ) from None
+        if disagrees(header, comparands):
+            return True
+    return False
 
 
 # --- Line-level helpers -------------------------------------------------------
