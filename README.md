@@ -52,3 +52,12 @@ Here are some ideas to get you started:
 - 😄 Pronouns: ...
 - ⚡ Fun fact: ...
 -->
+
+---
+
+## Camo animation test (E7 task 3b — temporary)
+
+RFC 001 verify-then-adopt item 7: does an animated WebP survive Camo on github.com?
+The image below alternates two distinct frames every 500 ms. If it visibly blinks, animation survives; if it is a static frame, it does not.
+
+![camo-webp-test](camo-test.webp)
