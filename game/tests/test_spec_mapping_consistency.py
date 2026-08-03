@@ -655,6 +655,59 @@ def test_section_state_precedence_is_stated_in_the_spec():
     )
 
 
+def test_sealing_pins_match_the_spec_enum():
+    """SPEC 5.9: the sealing predicate contains exactly the replay's INPUTS.
+
+    `build` is an artifact of compiling one of them, and the golden fixture
+    demonstrates two artifacts of the same input replaying identically — so
+    sealing on it seals on a property the replay does not have.
+    """
+    sentence = extract(
+        r"\*\*The sealing predicate contains exactly the replay's inputs\.\*\*\s*(.+?)\.",
+        field="sealing_pins",
+    )
+    spec_pins = re.findall(r"`([a-z_]+)`", sentence)
+    assert spec_pins, "DRIFT [sealing_pins]: could not parse the SPEC §5.9 sentence"
+    json_pins = mapping()["sealing_pins"]
+    assert json_pins == spec_pins, (
+        f"DRIFT [sealing_pins]: mapping/v1.json={json_pins} — "
+        f"game/SPEC.md §5.9={spec_pins} (order-sensitive)"
+    )
+
+
+def test_build_is_not_a_sealing_pin():
+    """The whole ruling in one assertion. An image rotation is an infrastructure
+    event with no game meaning, and sealing would answer it by demanding a
+    `new game` — discarding a live session to repair nothing."""
+    assert "build" not in mapping()["sealing_pins"], (
+        "DRIFT [sealing_pins]: `build` is provenance (SPEC §5.9), never a comparand"
+    )
+
+
+def test_every_sealing_pin_is_a_section_header_field():
+    """The pins name header fields, so a rename on either side must not pass.
+
+    SPEC 5.2's six fields are unchanged by §5.9; `mapping` is the header's
+    mapping-version field, and `n` is the section number, not a pin.
+    """
+    header_fields = {"n", "engine", "build", "wad", "mapping"}
+    unknown = [pin for pin in mapping()["sealing_pins"] if pin not in header_fields]
+    assert not unknown, (
+        f"DRIFT [sealing_pins]: {unknown} name no SPEC §5.2 header field"
+    )
+    assert "n" not in mapping()["sealing_pins"], (
+        "DRIFT [sealing_pins]: the section number is not a determinism pin"
+    )
+
+
+def test_the_spec_keeps_build_in_the_header_as_provenance():
+    """Removing it from the predicate must not remove it from the format:
+    §5.2's six fields are unchanged and every committed log keeps its meaning."""
+    assert re.search(r"`build=` stays in the header", spec_text()), (
+        "DRIFT [sealing_pins]: SPEC §5.9 no longer states that `build=` remains"
+    )
+
+
 def test_adding_section_states_did_not_widen_the_reason_code_enum():
     """SPEC 5.7 is explicitly unchanged by SPEC 5.8: section state is a separate
     top-level field, not a seventh code. The two share the literal `sealed` by
