@@ -43,21 +43,43 @@ from conftest import (
     make_readme_bytes,
     run_parser,
     run_rewriter,
+    OTHER_TEST_REPOSITORY,
+    TEST_REPOSITORY,
 )
 
+# SPEC 9.1 names no repository, so neither does this checker: it DISCOVERS the
+# target from the link the renderer emitted. A pattern carrying a literal
+# repository would re-create the constant the ruling removed, and — worse —
+# would still pass for a renderer that ignored its argument and kept the
+# hardcode, because the literal would be the hardcoded value.
 LINK_RE = re.compile(
-    r"https://github\.com/nikitastetskiy/nikitastetskiy/issues/new\?[^)\s\"'<]+"
+    r"https://github\.com/([^/\s)]+/[^/\s)]+)/issues/new\?[^)\s\"'<]+"
+)
+#: SPEC 9.1, verbatim: the grammar IS the sanitizer, so the committed artifact
+#: is held to it too.
+REPOSITORY_GRAMMAR = re.compile(
+    r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9._-]{1,100}\Z"
 )
 
 
-def extract_link_titles(block_text: str):
-    titles = []
-    for url in LINK_RE.findall(block_text):
+def extract_links(block_text: str):
+    """[(repository, title)] for every control link, target read from the URL."""
+    links = []
+    for match in LINK_RE.finditer(block_text):
+        url = match.group(0)
         query = urllib.parse.urlsplit(url).query
         params = urllib.parse.parse_qs(query, keep_blank_values=True)
         assert "title" in params, f"control link without title param: {url}"
-        titles.append(params["title"][0])
-    return titles
+        links.append((match.group(1), params["title"][0]))
+    return links
+
+
+def extract_link_titles(block_text: str):
+    return [title for _, title in extract_links(block_text)]
+
+
+def extract_link_targets(block_text: str):
+    return {repository for repository, _ in extract_links(block_text)}
 
 
 def assert_all_titles_parse(titles, tmp_path, *, source):
@@ -108,7 +130,7 @@ def test_readme_game_block_is_self_consistent_in_its_current_cutover_stage(tmp_p
     working_copy.write_bytes(data)
     proc = run_rewriter(
         working_copy, state="PAUSED",
-        image_url="https://example.com/doom.gif?run=selfcheck", controls_enabled=True,
+        image_url="https://example.com/doom.gif?run=selfcheck", controls_enabled=True, repository=TEST_REPOSITORY,
     )
     assert proc.returncode == 0, (
         f"enabled-mode render of the real README failed: {proc.stdout!r} {proc.stderr!r}"
@@ -144,7 +166,7 @@ def test_rendered_control_table_is_self_consistent_by_construction(tmp_path):
     readme.write_bytes(make_readme_bytes())
     proc = run_rewriter(
         readme, state="LIVE",
-        image_url="https://example.com/doom.gif?run=1", controls_enabled=True,
+        image_url="https://example.com/doom.gif?run=1", controls_enabled=True, repository=TEST_REPOSITORY,
     )
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     block = inside_block_bytes(readme.read_bytes()).decode("utf-8")
@@ -162,7 +184,55 @@ def test_rendered_titles_equal_the_mapping_control_links_in_order(tmp_path):
     readme.write_bytes(make_readme_bytes())
     assert run_rewriter(
         readme, state="PAUSED",
-        image_url="https://example.com/paused.png", controls_enabled=True,
+        image_url="https://example.com/paused.png", controls_enabled=True, repository=TEST_REPOSITORY,
     ).returncode == 0
     block = inside_block_bytes(readme.read_bytes()).decode("utf-8")
     assert extract_link_titles(block) == CONTROL_LINKS
+
+
+# --- SPEC 9.1: the control-link target ---------------------------------------
+
+def test_every_control_link_in_the_committed_readme_shares_one_target():
+    """A block whose links point at two repositories is half-rendered.
+
+    The target is discovered, not asserted: SPEC 9.1 names no repository, and
+    a checker that named one would pass for the very hardcode the ruling
+    removed.
+    """
+    block = inside_block_bytes(README_PATH.read_bytes()).decode("utf-8")
+    targets = extract_link_targets(block)
+    if not targets:
+        placeholder = load_mapping()["controls_disabled_placeholder"]
+        assert placeholder in block, (
+            "the committed block carries neither control links nor the disabled "
+            "placeholder — it looks corrupt or hand-edited"
+        )
+        return
+    assert len(targets) == 1, f"control links point at several repositories: {targets}"
+
+
+def test_the_committed_readmes_control_target_matches_the_spec_grammar():
+    """The grammar is the entire escaping strategy (SPEC 9.1): the value is
+    interpolated into the URL path unescaped because the grammar admits no
+    character special in a URL or a Markdown link target."""
+    block = inside_block_bytes(README_PATH.read_bytes()).decode("utf-8")
+    for target in extract_link_targets(block):
+        assert REPOSITORY_GRAMMAR.fullmatch(target), (
+            f"committed control-link target {target!r} is outside the SPEC 9.1 "
+            f"grammar, so it was interpolated unescaped without being validated"
+        )
+
+
+def test_the_rendered_block_targets_the_repository_it_was_handed(tmp_path):
+    """Two distinct targets, because one cannot tell "used the argument" apart
+    from "matched a constant that happens to equal it"."""
+    for repository in (TEST_REPOSITORY, OTHER_TEST_REPOSITORY):
+        readme = tmp_path / f"{repository.replace('/', '_')}.md"
+        readme.write_bytes(make_readme_bytes())
+        proc = run_rewriter(readme, state="LIVE",
+                            image_url="https://example.com/doom.gif",
+                            controls_enabled=True, repository=repository)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        block = inside_block_bytes(readme.read_bytes()).decode("utf-8")
+        assert extract_link_targets(block) == {repository}, block
+        assert extract_link_titles(block) == CONTROL_LINKS

@@ -63,9 +63,27 @@ LOG_FULL_MESSAGE = "log full — start a new game"  # SPEC section 6, verbatim
 # SPEC 5.5 rule 3, verbatim — no interpolation, parallel to LOG_FULL_MESSAGE
 SEALED_MESSAGE = "the arcade is being upgraded — press New game to continue"
 
-# SPEC section 9: control table
-ISSUE_URL_PREFIX = "https://github.com/nikitastetskiy/nikitastetskiy/issues/new?title="
+# SPEC section 9 / 9.1: control table
+#
+# SPEC 9.1 names NO repository: the control-link target is supplied at render
+# time from GITHUB_REPOSITORY, because only the environment's value is the
+# running repository by definition. So the tests name no repository either —
+# they exercise arbitrary targets and assert the renderer used what it was
+# handed. Two distinct values, because one value cannot tell "used the
+# argument" apart from "matched a constant that happens to equal it".
+TEST_REPOSITORY = "octo-sandbox/doom-rehearsal"
+OTHER_TEST_REPOSITORY = "another-owner/another.repo-1"
 ISSUE_BODY_PARAM = "Just%20press%20Submit%20%E2%80%94%20your%20move%20runs%20automatically."
+
+
+def issue_url_prefix(repository):
+    """The control-link prefix for a given `<owner>/<name>` target (SPEC 9.1).
+
+    The owner/name separator is structural and interpolated unescaped; the
+    anchored grammar is what makes that sound, so this mirrors the renderer's
+    composition rather than re-encoding it.
+    """
+    return f"https://github.com/{repository}/issues/new?title="
 CONTROL_LINKS = [
     "doom: forward",
     "doom: forward x5",
@@ -283,11 +301,20 @@ def inside_block_bytes(data: bytes) -> bytes:
 
 
 def run_rewriter(readme_path, *, state, image_url, controls_enabled=False,
-                 mapping=MAPPING_PATH, extra_args=()):
+                 repository=None, mapping=MAPPING_PATH, extra_args=()):
+    """Invoke rewrite_readme.py.
+
+    `repository` is SPEC 9.1's control-link target and defaults to None — NOT
+    to a value — so a caller that renders the control table must name one, the
+    same way the workflow must. A default here would hide exactly the usage
+    error the SPEC requires.
+    """
     args = ["--readme", str(readme_path), "--mapping", str(mapping),
             "--state", state, "--image-url", image_url]
     if controls_enabled:
         args.append("--controls-enabled")
+    if repository is not None:
+        args += ["--repository", repository]
     args += list(extra_args)
     return run_script("rewrite_readme.py", args)
 

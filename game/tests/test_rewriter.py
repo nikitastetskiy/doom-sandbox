@@ -1,7 +1,8 @@
 """
 @spec-handoff
 @interface rewrite_readme.py --readme PATH --mapping PATH --state
-    {LIVE,PAUSED,UNAVAILABLE,LOG_FULL,SEALED} --image-url URL [--controls-enabled];
+    {LIVE,PAUSED,UNAVAILABLE,LOG_FULL,SEALED} --image-url URL
+    [--controls-enabled --repository OWNER/NAME];
     exit 0 ok / 2 usage / 6 marker-validation failure; stdout JSON {"ok": true}
     or {"ok": false, "marker_error": missing-start|missing-end|duplicate-start|
     duplicate-end|reversed} (classes checked in that order, substring counts)
@@ -16,12 +17,25 @@
       (mapping, state, image-url, flags), independent of the prior block
     - Block embeds --image-url verbatim with fixed alt text "DOOM (<STATE>)";
       controls enabled -> 3-column x 4-row markdown table of the mapping's 12
-      control_links in order (row-major); href = https://github.com/
-      nikitastetskiy/nikitastetskiy/issues/new?title=<RFC3986 %-encoded title,
-      %20 for space>&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20
+      control_links in order (row-major); href = https://github.com/<the
+      --repository value>/issues/new?title=<RFC3986 %-encoded title, %20 for
+      space>&body=Just%20press%20Submit%20%E2%80%94%20your%20move%20
       runs%20automatically. ; label = mapping token label (+ " x<n>" on repeat
       variants); controls disabled -> the mapping's controls_disabled_placeholder
       line exactly, zero issues/new?title= links
+    - AMENDMENT (SPEC 9.1): NEW ARGUMENT --repository OWNER/NAME, the
+      control-link target, supplied by the workflow from GITHUB_REPOSITORY.
+      Required IF AND ONLY IF --controls-enabled; NO default and NO fallback,
+      and no repository may remain as a literal in the module (the current
+      ISSUE_NEW_URL constant is the defect). Rendering the table without it is
+      exit 2, README byte-untouched. The value is validated as an anchored
+      ASCII full match against
+      \\A[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9._-]{1,100}\\z and then
+      interpolated into the URL path UNESCAPED, because the `/` is structural.
+      That is sound only because the grammar admits no character special in a
+      URL (? # & % : @ space) or a Markdown link target (( ) < > " ` \\ space) —
+      the validation IS the escaping strategy, not a courtesy check. A reject
+      is exit 2 with the README untouched
 @edge-cases
     - Marker text quoted anywhere else in the file (prose or code fence) ->
       duplicate class -> abort untouched; missing final newline after the END
@@ -43,7 +57,10 @@ from conftest import (
     CONTROL_TABLE_COLUMNS,
     CONTROL_TABLE_ROWS,
     ISSUE_BODY_PARAM,
-    ISSUE_URL_PREFIX,
+    OTHER_TEST_REPOSITORY,
+    SCRIPTS_DIR,
+    TEST_REPOSITORY,
+    issue_url_prefix,
     MARKER_END_B,
     MARKER_START_B,
     TOKENS,
@@ -140,10 +157,10 @@ def test_rewrite_is_idempotent_f_of_f_equals_f(tmp_path):
     byte-identical README."""
     path = write_readme(tmp_path, make_readme_bytes())
     assert run_rewriter(path, state="LIVE", image_url=GIF_URL,
-                        controls_enabled=True).returncode == 0
+                        controls_enabled=True, repository=TEST_REPOSITORY).returncode == 0
     first = path.read_bytes()
     assert run_rewriter(path, state="LIVE", image_url=GIF_URL,
-                        controls_enabled=True).returncode == 0
+                        controls_enabled=True, repository=TEST_REPOSITORY).returncode == 0
     second = path.read_bytes()
     assert second == first
 
@@ -198,7 +215,7 @@ def test_unicode_and_crlf_outside_markers_survive_byte_exact(tmp_path):
 # --- Control-table rendering (SPEC section 9, plan D5) ----------------------
 
 def expected_href(title: str) -> str:
-    return ISSUE_URL_PREFIX + urllib.parse.quote(title, safe="") + "&body=" + ISSUE_BODY_PARAM
+    return issue_url_prefix(TEST_REPOSITORY) + urllib.parse.quote(title, safe="") + "&body=" + ISSUE_BODY_PARAM
 
 
 def expected_label(title: str) -> str:
@@ -212,7 +229,7 @@ def expected_label(title: str) -> str:
 
 def test_enabled_control_table_renders_all_12_links_in_spec_order(tmp_path):
     path = write_readme(tmp_path, make_readme_bytes())
-    proc = run_rewriter(path, state="LIVE", image_url=GIF_URL, controls_enabled=True)
+    proc = run_rewriter(path, state="LIVE", image_url=GIF_URL, controls_enabled=True, repository=TEST_REPOSITORY)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     block = inside_block_bytes(path.read_bytes()).decode("utf-8")
     hrefs = [expected_href(t) for t in CONTROL_LINKS]
@@ -221,27 +238,27 @@ def test_enabled_control_table_renders_all_12_links_in_spec_order(tmp_path):
         assert href in block, f"missing control link for {href}"
         positions.append(block.index(href))
     assert positions == sorted(positions), "links must appear in SPEC section 9 order"
-    assert block.count(ISSUE_URL_PREFIX) == 12
+    assert block.count(issue_url_prefix(TEST_REPOSITORY)) == 12
 
 
 def test_enabled_control_table_is_3_columns_by_4_rows(tmp_path):
     path = write_readme(tmp_path, make_readme_bytes())
     assert run_rewriter(path, state="LIVE", image_url=GIF_URL,
-                        controls_enabled=True).returncode == 0
+                        controls_enabled=True, repository=TEST_REPOSITORY).returncode == 0
     block = inside_block_bytes(path.read_bytes()).decode("utf-8")
     link_rows = [
         line for line in block.splitlines()
-        if ISSUE_URL_PREFIX in line
+        if issue_url_prefix(TEST_REPOSITORY) in line
     ]
     assert len(link_rows) == CONTROL_TABLE_ROWS
     for row in link_rows:
-        assert row.count(ISSUE_URL_PREFIX) == CONTROL_TABLE_COLUMNS
+        assert row.count(issue_url_prefix(TEST_REPOSITORY)) == CONTROL_TABLE_COLUMNS
 
 
 def test_control_labels_come_from_the_mapping_including_repeat_suffix(tmp_path):
     path = write_readme(tmp_path, make_readme_bytes())
     assert run_rewriter(path, state="LIVE", image_url=GIF_URL,
-                        controls_enabled=True).returncode == 0
+                        controls_enabled=True, repository=TEST_REPOSITORY).returncode == 0
     block = inside_block_bytes(path.read_bytes()).decode("utf-8")
     for title in CONTROL_LINKS:
         assert expected_label(title) in block
@@ -251,7 +268,7 @@ def test_control_labels_come_from_the_mapping_including_repeat_suffix(tmp_path):
 def test_every_control_link_carries_the_fixed_body_param(tmp_path):
     path = write_readme(tmp_path, make_readme_bytes())
     assert run_rewriter(path, state="LIVE", image_url=GIF_URL,
-                        controls_enabled=True).returncode == 0
+                        controls_enabled=True, repository=TEST_REPOSITORY).returncode == 0
     block = inside_block_bytes(path.read_bytes()).decode("utf-8")
     assert block.count("&body=" + ISSUE_BODY_PARAM) == 12
 
@@ -266,7 +283,7 @@ def test_disabled_controls_render_the_exact_placeholder_and_no_links(tmp_path):
     assert proc.returncode == 0
     block = inside_block_bytes(path.read_bytes()).decode("utf-8")
     assert placeholder in block
-    assert ISSUE_URL_PREFIX not in block
+    assert issue_url_prefix(TEST_REPOSITORY) not in block
     assert "issues/new?title=" not in block
 
 
@@ -282,3 +299,170 @@ def test_mapping_control_links_array_matches_spec_section_9(tmp_path):
         assert base in canonical or title in canonical
     path = write_readme(tmp_path, make_readme_bytes())
     assert run_rewriter(path, state="LIVE", image_url=GIF_URL).returncode == 0
+
+
+# --- SPEC 9.1: the control-link target ---------------------------------------
+#
+# The motivating instance: the renderer carried the profile repository as a
+# module constant, so when the rehearsal sandbox rendered the block, 12 of 12
+# links pointed at the profile — a click would have filed a stranger's move on
+# a repository whose workflow the sandbox never runs. A boundary violation and
+# a dead control, from one correct-looking literal.
+
+def test_the_control_table_cannot_be_rendered_without_a_target(tmp_path):
+    """No default, no fallback: a default is indistinguishable from a hardcode
+    at the exact moment it matters — the first deployment that is not the one
+    the default names."""
+    path = write_readme(tmp_path, make_readme_bytes())
+    before = path.read_bytes()
+    proc = run_rewriter(path, state="LIVE", image_url=GIF_URL,
+                        controls_enabled=True, repository=None)
+    assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
+    assert path.read_bytes() == before, "the README must be byte-untouched"
+
+
+def test_a_target_is_not_required_when_the_control_table_is_not_rendered(tmp_path):
+    """Required if and only if the table is rendered: with --controls-enabled
+    absent the placeholder line is rendered, there is no link, and there is
+    nothing to target."""
+    path = write_readme(tmp_path, make_readme_bytes())
+    proc = run_rewriter(path, state="LIVE", image_url=GIF_URL,
+                        controls_enabled=False, repository=None)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    block = inside_block_bytes(path.read_bytes()).decode("utf-8")
+    assert "issues/new?title=" not in block, block
+
+
+def test_the_rendered_links_target_the_repository_supplied(tmp_path):
+    path = write_readme(tmp_path, make_readme_bytes())
+    assert run_rewriter(path, state="LIVE", image_url=GIF_URL,
+                        controls_enabled=True,
+                        repository=OTHER_TEST_REPOSITORY).returncode == 0
+    block = inside_block_bytes(path.read_bytes()).decode("utf-8")
+    assert block.count(issue_url_prefix(OTHER_TEST_REPOSITORY)) == 12, block
+    assert issue_url_prefix(TEST_REPOSITORY) not in block, (
+        "a second target leaked into the render"
+    )
+
+
+def test_no_repository_is_baked_into_the_renderer_source():
+    """The residual SPEC 9.1 closes by SOURCE rather than by predicate: an
+    authored literal passes the grammar exactly as readily as the correct
+    value, so 'where the value comes from' is normative."""
+    source = (SCRIPTS_DIR / "rewrite_readme.py").read_text(encoding="utf-8")
+    offenders = [
+        line.strip() for line in source.splitlines()
+        if "github.com/" in line and "issues/new" in line and "{" not in line
+        and not line.strip().startswith("#")
+    ]
+    assert offenders == [], (
+        f"rewrite_readme.py authors a control-link URL with a literal target: "
+        f"{offenders}"
+    )
+
+
+# SPEC 9.1, verbatim: \A[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9._-]{1,100}\z
+VALID_TARGETS = {
+    "minimal": "a/b",
+    "digits-only": "0/9",
+    "dots-in-name": "owner/name.with.dots",
+    "hyphens-in-name": "owner/name-with-hyphens",
+    "underscores-in-name": "owner/name_with_underscores",
+    "hyphen-inside-owner": "an-owner/a-name",
+    "owner-at-39-chars": "a" * 39 + "/name",
+    "name-at-100-chars": "owner/" + "n" * 100,
+}
+
+INVALID_TARGETS = {
+    # Shape
+    "no-separator": "ownername",
+    "two-separators": "owner/name/extra",
+    "empty-owner": "/name",
+    "empty-name": "owner/",
+    "owner-starts-with-hyphen": "-owner/name",
+    "owner-starts-with-dot": ".owner/name",
+    "owner-at-40-chars": "a" * 40 + "/name",
+    "name-at-101-chars": "owner/" + "n" * 101,
+    # Characters special in a URL — the grammar admits none of them, which is
+    # the ENTIRE reason the value may be interpolated unescaped.
+    "question-mark": "owner/na?me",
+    "hash": "owner/na#me",
+    "ampersand": "owner/na&me",
+    "percent": "owner/na%20me",
+    "colon": "owner/na:me",
+    "at-sign": "owner/na@me",
+    "space": "owner/na me",
+    # Characters special in a Markdown link target
+    "close-paren": "owner/na)me",
+    "open-paren": "owner/na(me",
+    "angle-brackets": "owner/na<me>",
+    "double-quote": 'owner/na"me',
+    "backtick": "owner/na`me",
+    "backslash": "owner/na\\me",
+    # Injection shapes
+    "newline": "owner/name\nowner2/name2",
+    "full-url": "https://github.com/owner/name",
+    "leading-slash": "/owner/name",
+    "non-ascii": "ówner/name",
+}
+
+
+@pytest.mark.parametrize("target", VALID_TARGETS.values(), ids=list(VALID_TARGETS))
+def test_a_target_inside_the_grammar_is_accepted(tmp_path, target):
+    path = write_readme(tmp_path, make_readme_bytes())
+    proc = run_rewriter(path, state="LIVE", image_url=GIF_URL,
+                        controls_enabled=True, repository=target)
+    assert proc.returncode == 0, (target, proc.stdout, proc.stderr)
+    block = inside_block_bytes(path.read_bytes()).decode("utf-8")
+    assert block.count(issue_url_prefix(target)) == 12, block
+
+
+@pytest.fixture(scope="module")
+def repository_probe(tmp_path_factory):
+    """One render with a KNOWN-GOOD target, shared by every reject test."""
+    path = write_readme(tmp_path_factory.mktemp("probe"), make_readme_bytes())
+    return run_rewriter(path, state="LIVE", image_url=GIF_URL,
+                        controls_enabled=True, repository=TEST_REPOSITORY)
+
+
+def assert_the_grammar_is_what_rejects(probe):
+    """Guard against a false green on every reject test below.
+
+    While `--repository` is unrecognized argparse exits 2 for EVERY value, so a
+    reject test passes without the SPEC 9.1 grammar existing at all — the right
+    answer for the wrong reason. Requiring a VALID target to succeed first
+    makes those tests report the grammar and nothing else.
+    """
+    assert probe.returncode == 0, (
+        "rewrite_readme.py does not accept --repository, so every reject here "
+        "would pass on argparse's exit 2 rather than on the SPEC 9.1 grammar: "
+        f"{probe.stderr!r}"
+    )
+
+
+@pytest.mark.parametrize("target", INVALID_TARGETS.values(), ids=list(INVALID_TARGETS))
+def test_a_target_outside_the_grammar_is_a_usage_error(tmp_path, target,
+                                                       repository_probe):
+    """The validation is not a courtesy check — it is the entire escaping
+    strategy, and may not be relaxed without replacing it."""
+    assert_the_grammar_is_what_rejects(repository_probe)
+    path = write_readme(tmp_path, make_readme_bytes())
+    before = path.read_bytes()
+    proc = run_rewriter(path, state="LIVE", image_url=GIF_URL,
+                        controls_enabled=True, repository=target)
+    assert proc.returncode == 2, (target, proc.returncode, proc.stdout, proc.stderr)
+    assert path.read_bytes() == before, f"README was touched on reject: {target!r}"
+
+
+def test_the_grammar_is_anchored_at_both_ends(tmp_path, repository_probe):
+    """An unanchored match would admit a valid target with arbitrary bytes
+    attached, which is the one way an unescaped interpolation can escape."""
+    assert_the_grammar_is_what_rejects(repository_probe)
+    path = write_readme(tmp_path, make_readme_bytes())
+    for target in ("owner/name)](https://evil.example)", "owner/name?x=1",
+                   "prefix owner/name", "owner/name suffix"):
+        before = path.read_bytes()
+        proc = run_rewriter(path, state="LIVE", image_url=GIF_URL,
+                            controls_enabled=True, repository=target)
+        assert proc.returncode == 2, (target, proc.stdout, proc.stderr)
+        assert path.read_bytes() == before, target
