@@ -94,7 +94,8 @@
     "sweep_cron": "17 */6 * * *",
     "sweep_owner_alert_consecutive_failures": 2,
     "abuse_trailing_24h_run_threshold": 200,
-    "title_byte_cap": 64
+    "title_byte_cap": 64,
+    "idle_pause_days": 45
   },
   "latency": {
     "trailing_window_moves": 20,

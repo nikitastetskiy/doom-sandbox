@@ -8,11 +8,26 @@ satisfy "not too large".  So the gate runs three ordered checks, and every
 normative value it compares against is read at runtime from the mapping file
 (``budget.floor_bytes``, ``budget.ceiling_bytes``, ``budget.ladder``):
 
-  1. **Structural validity** -- the file exists, is non-empty, and begins with
-     the ``GIF89a`` magic.  Enforced here **independently and unconditionally**,
-     before any size verdict, even though the workflow checks it too: assuming
-     validity because an upstream gate exists is the antipattern 12.1 makes
-     normative against (same defense-in-depth precedent as SPEC 5.5 rule 4).
+  1. **Structural validity** -- positive property: the artifact is the
+     *complete* output of a GIF writer.  Evidence: the file exists, is
+     non-empty, **begins** with the ``GIF89a`` magic and **ends** with the
+     ``0x3B`` trailer.  Head and tail, because they establish different halves
+     of the property and neither substitutes for the other -- the magic proves
+     a writer started, the trailer is the last byte the muxer emits and so
+     proves one finished.  Head-only evidence is structurally incapable of
+     detecting truncation: truncation removes bytes from the *end*, and no care
+     in reading the header can speak to any byte after offset 5.  Enforced here
+     **independently and unconditionally**, before any size verdict, even though
+     the workflow checks it too: assuming validity because an upstream gate
+     exists is the antipattern 12.1 makes normative against (same
+     defense-in-depth precedent as SPEC 5.5 rule 4).
+
+     Residual it does **not** establish (SPEC 0.3): the block chain between the
+     two ends.  Truncation landing exactly on a ``0x3B`` byte (~0.3 % of offsets
+     in a reference L0 artifact) and mid-file corruption both still pass.
+     Closing them needs a decoder in the publish gate, rejected as
+     disproportionate.  Semantic degeneracy (palette collapse) is deliberately
+     the floor's job, not this step's.
   2. **Floor** -- ``size > floor_bytes``.  The floor is **exclusive** while the
      ceiling is **inclusive**; the asymmetry is deliberate, not an oversight.
   3. **Ceiling / ladder** -- ``size <= ceiling_bytes``, else descend a rung.
@@ -32,6 +47,12 @@ would otherwise publish.
 
 A nonexistent ``--file`` path stays a usage error (exit 2): that is a malformed
 *invocation*, not a malformed *artifact*.
+
+**Only ``--file`` is a publication path.**  ``--size`` asserts a byte count with
+no artifact behind it, so step 1 has nothing to read -- structural evidence is
+not skipped there, it is *unavailable*.  ``--size`` is a tuning and diagnostic
+entry point and its exit code is a **size verdict only**, which is why
+``--size 0`` yields 12 while a 0-byte *file* yields 13: two different questions.
 
 Usage: budget.py --mapping PATH --rung LEVEL (--size BYTES | --file PATH)
 Exit codes: 0 publish / 2 usage / 10 over ceiling, re-encode at "next" /
@@ -62,10 +83,6 @@ REASON_STRUCTURE = "structure"
 REASON_FLOOR = "floor"
 REASON_CEILING = "ceiling"
 
-#: SPEC 12.1 gate step 1.  The encoder is pinned to ``-f gif``, which always
-#: writes the 89a version block; 87a is not a thing this pipeline can produce.
-GIF_MAGIC = b"GIF89a"
-
 
 def _emit(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=True))
@@ -95,8 +112,15 @@ def main(argv=None) -> int:
         ceiling = int(budget["ceiling_bytes"])
         floor = int(budget["floor_bytes"])
         ladder = list(budget["ladder"])
+        # SPEC 12.1: the structural literals are authored once, in the mapping,
+        # and read at runtime -- never repeated in the script or the workflow.
+        structure = budget["structure"]
+        magic = bytes.fromhex(structure["magic_hex"])
+        trailer = bytes.fromhex(structure["trailer_hex"])
     except (OSError, ValueError, KeyError, TypeError):
         return _usage("mapping file has no usable budget section")
+    if not magic or not trailer:
+        return _usage("mapping budget.structure carries an empty magic or trailer")
 
     def verdict(payload: dict) -> None:
         """Every verdict reports the floor alongside the ceiling (SPEC 12.1)."""
@@ -121,14 +145,19 @@ def main(argv=None) -> int:
             return _usage("--file does not exist")
         try:
             size = candidate.stat().st_size
-            with open(candidate, "rb") as stream:
-                head = stream.read(len(GIF_MAGIC))
+            head = tail = b""
+            if size:
+                with open(candidate, "rb") as stream:
+                    head = stream.read(len(magic))
+                    stream.seek(max(0, size - len(trailer)))
+                    tail = stream.read(len(trailer))
         except OSError:
             return _usage("--file is unreadable")
 
-        # SPEC 12.1 gate step 1, before any size verdict. Orthogonal to size:
-        # a 1.5 MB non-GIF clears both the floor and the ceiling.
-        if size == 0 or head != GIF_MAGIC:
+        # SPEC 12.1 gate step 1, before any size verdict. Orthogonal to size: a
+        # 1.5 MB non-GIF clears both the floor and the ceiling, and a truncated
+        # GIF keeps its header, so the tail is the only evidence that catches it.
+        if size == 0 or head != magic or tail != trailer:
             verdict({"publish": False, "size": size, "hard_fail": True,
                      "next": None, "reason": REASON_STRUCTURE})
             return EXIT_STRUCTURE

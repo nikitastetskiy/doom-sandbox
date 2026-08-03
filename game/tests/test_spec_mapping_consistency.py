@@ -50,6 +50,7 @@ KNOB_ROW_PATTERNS = {
     "sweep_owner_alert_consecutive_failures": r"^Sweep owner-alert threshold",
     "abuse_trailing_24h_run_threshold": r"^Trailing-24h abuse run-count threshold",
     "title_byte_cap": r"^Title byte cap",
+    "idle_pause_days": r"^Idle-to-PAUSED threshold",
 }
 
 # Structural linkage for the SPEC section 7 latency prose -> mapping key.
