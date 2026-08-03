@@ -390,13 +390,23 @@ gh workflow run doom.yml --repo "$REPO" --ref main
 `the arcade is being upgraded — press New game to continue`, the README shows the
 SEALED screen, the ledger stops growing and no new GIF is published.
 
-**This is the guard working, not a fault.** A section is *sealed* when any pin in
-its header — `engine`, `build`, `wad`, `mapping` — no longer matches the running
-toolchain, which happens whenever the engine, the WAD, the mapping version or the
-recorded build hash is bumped. Rather than append moves to a section it can no
-longer reproduce, the game refuses to advance that section and says so. Sealing
-is computed at run time by comparison; it is never stored or configured, so there
-is no flag to unset.
+**This is the guard working, not a fault.** A section is *sealed* when one of its
+**sealing pins** — `engine`, `wad`, `mapping` (SPEC §5.2, mirrored as
+`sealing_pins` in `game/mapping/v1.json`) — no longer matches the running
+toolchain, which happens whenever the engine commit, the WAD or the mapping
+version is bumped in a default-branch commit. Rather than append moves to a
+section it can no longer reproduce, the game refuses to advance that section and
+says so. Sealing is computed at run time by comparison; it is never stored or
+configured, so there is no flag to unset.
+
+**`build` is not a sealing pin** (SPEC §5.9). The header still carries it, as a
+record of which binary produced that section's frames, but nothing compares it:
+a binary's SHA-256 is a property of the **runner image version**, which GitHub
+rotates on its own schedule, and sealing on it would answer an infrastructure
+event by demanding a `new game` — discarding a live session's history to repair
+nothing. Determinism is pinned on the **replay** instead
+([section 12](#12-engine-replay-equivalence-spec-59)). So a `build=` that differs
+from `game/toolchain.json` seals nothing and is not why you are here.
 
 **It clears itself.** `doom: new game` contributes zero frames, so it provably
 cannot alter the sealed section's replay output — which makes it the one
@@ -414,14 +424,18 @@ exactly one pin should differ:
 ```sh
 gh run list --repo "$REPO" --workflow doom.yml --limit 5      # green, not red
 grep '^#section ' game/state/log.txt | tail -1                # the header in force
-jq '{engine: .engine.commit_sha, wad: .wad.sha256,
-     build: .engine.build_sha256.value, build_status: .engine.build_sha256.status}' game/toolchain.json
+# Only the three sealing pins are comparands. `build` is deliberately absent.
+jq '{engine: .engine.commit_sha, wad: .wad.sha256}' game/toolchain.json
 jq -r '.mapping_version' game/mapping/v1.json
+jq -r '.sealing_pins | join(", ")' game/mapping/v1.json        # engine, wad, mapping
 ```
 
-A `build` that differs while `engine` matches usually means the recorded engine
-build hash is still the provisional local value and the canonical `ubuntu-24.04`
-hash has not been captured yet.
+The run log states the section's state outright, on every run — including one
+that drained nothing:
+
+```sh
+gh run view <run-id> --repo "$REPO" --log | grep -o 'section=[a-z]*'   # sealed | capped | open
+```
 
 **To clear it now** — because nobody is playing, or because you just bumped the
 toolchain and want the game live again — submit the reset yourself. It is an
@@ -448,8 +462,9 @@ grep '^#section ' game/state/log.txt | tail -1   # pins now match the toolchain
 |---|---|
 | A `doom: new game` was submitted but the section did not roll over | the drain is not applying the sealed-mode exemption |
 | *Apply moves* fails with **exit 7** | a frame-contributing move reached `apply_moves.py` while sealed; the drain should have rejected it first. Defense in depth caught it and wrote nothing — but the drain is wrong |
-| Sealed with no toolchain change | check recent commits to `game/toolchain.json` and `game/mapping/v1.json` |
-| Sealed before anyone has ever played | expected while the build hash is provisional; the first reset clears it |
+| Sealed with no toolchain change | check recent commits to `game/toolchain.json` and `game/mapping/v1.json` for a move in `engine`, `wad` or `mapping_version` |
+| Sealed after an engine cache miss or a runner image rotation, with no pin commit | a defect. `build` is not a comparand (SPEC §5.9), so a rebuilt binary cannot seal anything. Two sealed sections appearing one per reset is the livelock signature §5.9 records — stop the game |
+| The run failed instead of sealing | not this section. A hard failure at *Restore the pinned toolchain* is [section 12](#12-engine-replay-equivalence-spec-59) |
 
 For the first two, stop the game
 ([section 3](#3-emergency-stop-gh-workflow-disable)) and treat it as a bug.
@@ -463,30 +478,47 @@ a reset roll the section over.
 
 ### How the SEALED screen gets there
 
-The workflow selects the screen from `drain.py`'s machine-readable `reason` codes,
-never from the player-visible guidance text — SPEC §5.7 makes the six codes a
-normative closed enum (`applied`, `duplicate`, `grammar`, `cooldown`,
-`section-cap`, `sealed`, mirrored in `game/mapping/v1.json` `reason_codes`) and
-states the rule directly: *no consumer may string-match a player-visible message*.
-Those messages are written for humans and may be reworded; the codes may not.
+The workflow **looks the screen up** from `drain.py`'s section state — a
+top-level `"section": {"state": "sealed"|"capped"|"open"}` in the drain's action
+plan, unconditional on every exit-0 drain (SPEC §5.8). The `work` step maps
+`sealed` → `SEALED`, `capped` → `LOG_FULL`, `open` → no screen, validating the
+value against `game/mapping/v1.json` `section_states` first. It is a **lookup,
+not a predicate**: the pin comparison lives in `drain.py`, which owns it, and is
+never re-derived in YAML (§0.5). Player-visible guidance prose is never matched
+either — those messages are written for humans and may be reworded (§5.7).
 
-When a run drains at least one move and appends none of them, the `work` step
-sets `all_rejected=true` and picks `state_screen=SEALED` (a `sealed` code present)
-or `LOG_FULL` (a `section-cap` code present); the *Swap in the SEALED or LOG_FULL
-guidance screen* step then rewrites the README block and pushes it. The run stays
-green throughout. A code outside the enum fails the run loudly rather than being
-counted as some seventh outcome — per §5.7 that is a drain defect, not a new state.
+An unmapped state, or a **missing** `section` member, fails the run loudly and
+writes no step output. That asymmetry is deliberate: `open` is the value that
+says *nothing to report*, absence says *the drain never told me*, and defaulting
+absence to "no screen" would turn a broken producer into a silent one in exactly
+the case the field exists to close.
 
-**Residual worth knowing (§0).** The swap is witnessed by *rejections*, so it fires
-only on a run that actually drained a move. SPEC §5.5 rule 7 treats three cases
-alike — an all-sealed-reject batch, an all-duplicate batch, and a batch with
-nothing admissible — but only the first emits a `sealed` code. A section that is
-sealed while **nobody is submitting moves** therefore will not swap the screen in
-on the idle sweep; it swaps on the next run that drains a real move, which is also
-the next moment a player is there to see it. Closing that gap needs a top-level
-"this section is sealed" flag in the drain's JSON output; re-deriving the pin
-comparison in the workflow is exactly what §5.7 and §0 forbid, so it is not done.
-If you need the screen up *now* on a quiet game, push it by hand (below).
+**Precedence (SPEC §11) — at most one screen per run, first rule wins:**
+
+| # | Rule | Effect |
+|---|---|---|
+| 1 | The abuse halt writes PAUSED and stops (§6) | nothing below runs |
+| 2 | A run that **publishes a frame** shows LIVE | the section's condition surfaces next run |
+| 3 | Otherwise the **section state** selects the guidance screen, outranking PAUSED | SEALED / LOG_FULL |
+| 4 | UNAVAILABLE, only on a §10 failure row | never over a guidance screen this run pushed |
+
+So the condition is **state selects the screen, a publish suppresses it** — not
+"the batch was all rejected". Two consequences worth knowing:
+
+- **A quiet blocked game now shows its screen.** A section sealed by a
+  default-branch commit with an empty queue rejects nothing, so the old
+  all-rejected gate left exactly that visitor staring at a stale live frame. The
+  idle sweep swaps it in now, and the idle-PAUSED step is suppressed by the same
+  state, because a section that is blocked is not idle — it is being played and
+  answered.
+- **LOG_FULL can legitimately be one run late.** Rule 2 strictly precedes rule 3,
+  and it is reached by the common case: a batch whose applied moves carry the
+  section past the frame cap ends `capped` *and* publishes a frame. That run
+  shows LIVE; the LOG_FULL screen appears on the next run, which is also the next
+  moment a player can act on it. This never delays SEALED — while sealed the only
+  admissible move is the zero-frame rollover, and applying it un-seals.
+
+The run stays green throughout.
 
 **The swap is best effort, exactly like the UNAVAILABLE swap.** Its push can lose
 a race with another writer, and it carries `continue-on-error: true` because
@@ -503,9 +535,9 @@ python3 game/scripts/rewrite_readme.py \
 git add -- README.md && git commit -m 'chore(doom): show the sealed screen' && git push
 ```
 
-Or just dispatch a run ([section 2](#2-manual-dispatch-drain-re-render-and-unavailable-recovery)) —
-but note that only works while moves are still arriving: the swap fires off a
-*drained batch*, so a run with nothing pending swaps nothing.
+Or just dispatch a run ([section 2](#2-manual-dispatch-drain-re-render-and-unavailable-recovery)).
+Any completed run re-renders it, including one with nothing pending — the screen
+follows the section's state, not the traffic.
 
 ---
 
@@ -527,11 +559,24 @@ The two are distinguishable and never ambiguous — the section cap is about
 
 | | LOG_FULL | SEALED |
 |---|---|---|
-| Cause | the section hit its frame cap | a header pin no longer matches the running toolchain |
+| Cause | the section hit its frame cap | a **sealing pin** (`engine`, `wad`, `mapping`) no longer matches the running toolchain |
+| Section state (§5.8) | `capped` | `sealed` |
 | Drain reason code | `section-cap` | `sealed` |
 | Player message | `log full — start a new game` | `the arcade is being upgraded — press New game to continue` |
 | `new game` cooldown | **applies** (30 min) | **does not apply** (§5.5 rule 6) |
 | Clears by | `doom: new game` | `doom: new game` |
+
+`sealed` wins where both hold at once, which is the order the drain already
+applies when admitting moves, so the reported state and the admission decision
+cannot disagree.
+
+**The screen can lag the cap by exactly one run, and that is correct.** The state
+is reported as of the **end of the batch**, so a run whose applied moves carried
+the section past the cap reports `capped` *and* published a frame. SPEC §11 rule
+2 precedes rule 3, so that run shows LIVE and LOG_FULL appears on the next run —
+which is also the next moment a player can do anything about it. If you see a
+`capped` state in the log and a LIVE frame on the profile from the same run,
+nothing is broken.
 
 **Confirm that is what you are looking at:**
 
@@ -676,6 +721,101 @@ before the gate, don't — extend the gate.
 
 ---
 
+## 12. Engine replay-equivalence (SPEC §5.9)
+
+**What is pinned.** Not the engine binary's bytes — the **replay**. The gate lives
+in exactly one place, `.github/actions/doom-toolchain`: when the engine is built
+from source, it replays the committed fixture `game/tests/fixtures/golden.stream`
+and checks the recorded framebuffer digest against
+`game/tests/fixtures/golden.expected.json`. A binary **restored from cache** does
+not pay it — it was already verified byte-exact against the recorded pin, and
+byte identity implies behavioural identity.
+
+Every invocation logs one greppable line, whether it passes or fails:
+
+```sh
+gh run view <run-id> --repo "$REPO" --log | grep 'doom-toolchain:'
+# doom-toolchain: engine-build-sha256=... pin-status=canonical pin-agrees=false
+#   origin=built-from-source replay=match replay-sha256=... runner-image=ubuntu24/...
+```
+
+### The two things you will actually see
+
+**A. `pin-agrees=false` with `replay=match`, run green.** A *provenance
+divergence*, and **not a fault**. The runner image rotated, so the same pinned
+commit compiled to different bytes; the replay proved the game is unchanged. The
+run proceeds, the action does **not** rewrite the pin (a runtime that re-pins
+itself certifies nothing), and it **skips the cache save**, because the key names
+a hash the binary does not carry. Nothing is broken and no section is sealed.
+
+The only cost is one rebuild per run until an operator re-pins. Do it at leisure:
+
+```sh
+gh run view <run-id> --repo "$REPO" --log | grep -o 'engine-build-sha256=[0-9a-f]*'
+# then, in a reviewed commit, set .engine.build_sha256.value to that hash
+jq -r '.engine.build_sha256.value' game/toolchain.json
+```
+
+Re-pinning is honest housekeeping — it keeps the `build=` written into new
+section headers a true record of the binary that will actually render them — not
+a repair of anything load-bearing. **Do not** bump `engine.commit_sha`, the WAD
+or `mapping_version` to "fix" it: those are sealing pins, and moving one forces
+every player to start a new game for an infrastructure event.
+
+**B. `replay=divergent`, job red at *Restore the pinned toolchain*.** A
+**toolchain fault**. The engine built from the pinned commit renders *different
+frames* from the committed history. This is deliberately a hard failure and not a
+seal: its repair is an operator re-pinning a broken build environment, not a
+player pressing New game, and sealing it would ask a visitor to discard a live
+session to work around a broken runner.
+
+The run takes the **pre-push** row of the write contract (§10) — ledger, stream
+and `output` branch byte-untouched, drained issues left open, best-effort
+UNAVAILABLE swap — and consecutive failures trip the sweep's owner alert.
+
+```sh
+gh run view <run-id> --repo "$REPO" --log-failed | grep -E '::error::|doom-toolchain:'
+jq -r '.recorded_stream_sha256' game/tests/fixtures/golden.expected.json
+```
+
+Where to look, in order:
+
+1. **The runner image.** Compare `runner-image=` against
+   `.engine.runner_image_sensitivity.runner_image`. An image rotation explains a
+   changed *binary*; it should **not** change the replay, so a divergence here is
+   a genuine finding about the compiler or libc, not routine drift.
+2. **The engine commit.** Did `.engine.commit_sha` or `build_cmd_linux` move? A
+   deliberate engine bump changes frames by design — but it must land as a
+   **sealing-pin** commit, which rolls the section over in band, not as a silent
+   rebuild.
+3. **The fixture itself.** `fixture-corrupt` (rather than `divergent`) means
+   `golden.stream` failed its own `fixture_sha256` — a bad checkout, not a bad
+   engine.
+
+Any verdict other than `match` or `byte-identical-pin` fails the job, including
+the ones that mean the gate could not be *evaluated* (`gate-input-unavailable`,
+`replay-failed`, `no-capture`, `frame-count`). That is intentional: a gate that
+cannot establish its property has not passed it (§0), and an absent verdict is
+never a passing one.
+
+**Do not** work around a divergence by relaxing the gate or by re-pinning
+`build_sha256` — the build hash is provenance and re-pinning it does not touch
+what failed. Stop the game
+([section 3](#3-emergency-stop-gh-workflow-disable)) and treat it as a bug in the
+toolchain pin.
+
+> **Residual (§0.3).** The fixture exercises one input stream through one level
+> path (966 tics, 700 recorded frames of continuous run/turn/strafe/fire). A
+> binary that diverges only on code the fixture never reaches — a weapon it does
+> not fire, a monster it does not meet, a map it does not enter — passes this gate
+> and could still fork a live timeline. DOOM's replay path is fixed-point integer
+> arithmetic with no wall-clock or floating-point dependence, which is why the
+> cross-architecture agreement is as strong as it is, but the remainder is
+> narrowed rather than closed. **Re-verify the fixture's coverage whenever the
+> engine commit changes.**
+
+---
+
 ## Appendix: what the pieces are
 
 | Path | Role |
@@ -683,7 +823,8 @@ before the gate, don't — extend the gate.
 | `game/state/log.txt` | **The game state.** Append-only sections; the only source of truth. |
 | `game/state/stream.txt` | Derived: `expand(ledger)` for the current section. Regenerated every run. |
 | `game/mapping/v1.json` | Versioned token→frame table, canonical titles, and every operational knob. |
-| `game/toolchain.json` | Determinism pins: engine commit + build hash, WAD hash, ffmpeg URL/hashes, runner label, encode recipe. |
+| `game/toolchain.json` | Engine commit, WAD hash, ffmpeg URL/hashes, runner image **label**, encode recipe — plus the engine build hash, which is **provenance, never a comparand** (§5.9). |
+| `game/tests/fixtures/golden.*` | The determinism gate's evidence: one committed input stream and the framebuffer digest it must reproduce (§5.9). Single authoring site for that constant. |
 | `game/SPEC.md` | Normative value tables, grammars, and the write contract. |
 | `game/scripts/` | All game logic, unit-tested standalone. The workflow only orchestrates. |
 | `.github/workflows/doom.yml` | The move loop: gate job + heavy job + sweep. |
@@ -711,7 +852,8 @@ next render applies it — no other file changes.
 Useful one-liners:
 
 ```sh
-# Current section header (engine/build/WAD/mapping pins in force).
+# Current section header. Sealing compares engine/wad/mapping only; `build` is
+# provenance and is never a comparand (SPEC 5.9).
 grep '^#section' game/state/log.txt | tail -1
 
 # Last 10 applied moves.
