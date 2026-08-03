@@ -366,25 +366,60 @@ def test_a_section_state_outside_the_mapping_enum_fails_the_step(tmp_path):
     assert "banana" in result.log, result.log
 
 
-def test_a_missing_section_member_fails_the_step(tmp_path):
-    """SPEC 5.8 clause 1 makes the field unconditional on every exit-0 drain, so
-    its absence is a defect in the drain — the same class as a missing `reason`,
-    and it must be refused for the same reason: silently defaulting to "no
-    screen" would leave a sealed game showing a stale live frame."""
-    plan = close_plan((1, "grammar"), section=NO_SECTION_FIELD)
-    assert "section" not in plan, plan
-    result = run_work_step(tmp_path, plan)
+# SPEC 5.8: "the member being absent, present-but-not-an-object, and present
+# with no `state` key; all three are the same fault and take the same path."
+# Each entry deforms a well-formed plan and asserts it IS that deformation
+# before the step is asked what it does with it.
+SECTION_FAULTS = {
+    "member-absent": (
+        lambda plan: plan.pop("section"),
+        lambda plan: "section" not in plan,
+    ),
+    "present-but-not-an-object": (
+        lambda plan: plan.__setitem__("section", "sealed"),
+        lambda plan: not isinstance(plan["section"], dict),
+    ),
+    "present-with-no-state-key": (
+        lambda plan: plan.__setitem__("section", {"reason": "sealed"}),
+        lambda plan: isinstance(plan["section"], dict) and "state" not in plan["section"],
+    ),
+}
+
+
+def faulted_plan(fault_id):
+    deform, is_that_fault = SECTION_FAULTS[fault_id]
+    plan = close_plan((1, "grammar"), section=SECTION_OPEN)
+    deform(plan)
+    assert is_that_fault(plan), f"fixture is not the {fault_id} fault: {plan!r}"
+    return plan
+
+
+@pytest.mark.parametrize("fault_id", list(SECTION_FAULTS), ids=list(SECTION_FAULTS))
+def test_a_malformed_section_member_fails_the_step(tmp_path, fault_id):
+    """SPEC 5.8: the absence of a witness must be distinguishable from the
+    witness saying nothing is wrong.
+
+    `open` is the value that says nothing to report; absence says the drain
+    never told me. Defaulting either of the three faults to "no screen" would
+    convert a broken producer into a silent one in exactly the case SPEC 5.8
+    exists to close — a sealed game keeps showing a stale live frame, and the
+    fault is indistinguishable from a healthy quiet run.
+    """
+    result = run_work_step(tmp_path, faulted_plan(fault_id))
     assert result.returncode != 0, result
     assert "::error::" in result.log, result.log
 
 
-def test_a_rejected_section_state_produces_no_step_output(tmp_path):
+@pytest.mark.parametrize("fault_id", list(SECTION_FAULTS), ids=list(SECTION_FAULTS))
+def test_a_malformed_section_member_produces_no_step_output(tmp_path, fault_id):
     """A defect in the drain must not produce a verdict about the game."""
-    for index, plan in enumerate((close_plan((1, "grammar"), section="banana"),
-                                  close_plan((1, "grammar"),
-                                             section=NO_SECTION_FIELD))):
-        result = run_work_step(tmp_path / f"case{index}", plan)
-        assert result.outputs == {}, result
+    result = run_work_step(tmp_path, faulted_plan(fault_id))
+    assert result.outputs == {}, result
+
+
+def test_an_unmapped_section_state_produces_no_step_output(tmp_path):
+    result = run_work_step(tmp_path, close_plan((1, "grammar"), section="banana"))
+    assert result.outputs == {}, result
 
 
 def test_the_section_state_enum_is_read_from_the_mapping(tmp_path):
@@ -695,15 +730,43 @@ def test_the_swap_step_refuses_a_state_screen_it_does_not_map(tmp_path):
 
 
 def test_the_swap_gate_does_not_require_an_all_rejected_batch():
-    """SPEC 5.8's whole purpose is the quiet run.
+    """SPEC 11 rule 2: gating on all-rejected is the defect SPEC 5.8 removed.
 
-    A sealed section with an empty queue has all_rejected false and a SEALED
-    screen; gating the swap on all_rejected would leave exactly the visitor the
-    field exists for looking at a stale live frame.
+    A sealed section with an empty queue rejects nothing, so an all-rejected
+    gate leaves exactly the visitor the field exists for staring at a stale
+    frame.
     """
     condition = workflow_step_field(STATE_SWAP_STEP, "if")
     assert "all_rejected" not in condition, condition
     assert "steps.work.outputs.state_screen" in condition, condition
+
+
+#: Outputs that exist only on a run which published a frame. `rung` is written
+#: solely on the ladder's exit-0 path; `moves` false means the encode never ran
+#: at all. Either is a sound suppressor; the workflow picks one.
+PUBLISH_SIGNALS = ("steps.encode.outputs.rung", "steps.work.outputs.moves")
+
+
+def test_the_swap_gate_names_a_publish_signal_so_a_live_frame_suppresses_it():
+    """SPEC 11 rule 2 strictly precedes rule 3: state selects the screen, and a
+    publish suppresses it.
+
+    Reached by the common case, not an exotic one — a batch whose applied moves
+    carry the section over the cap ends `capped` AND publishes, and neither is
+    a failure. Precedence resolves it with no tie-break: the run shows LIVE.
+    Checked structurally because an Actions `if:` cannot be evaluated without
+    re-implementing the expression language, which is the retype-the-normative-
+    thing mistake this suite exists to catch; the runtime half is
+    test_a_run_that_applied_moves_into_the_cap_still_reports_log_full, which
+    pins that the work step still REPORTS `capped` on that run.
+    """
+    condition = workflow_step_field(STATE_SWAP_STEP, "if")
+    named = [signal for signal in PUBLISH_SIGNALS if signal in condition]
+    assert named, (
+        "the swap gate names no publish signal, so a run that publishes a LIVE "
+        f"frame would also swap in a guidance screen (SPEC 11 rule 2): "
+        f"{condition!r}; expected one of {list(PUBLISH_SIGNALS)}"
+    )
 
 
 # --- moves / closes ---------------------------------------------------------
